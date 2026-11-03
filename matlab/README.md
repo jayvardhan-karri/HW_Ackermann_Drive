@@ -219,7 +219,7 @@ The simulation uses the synthetic scan; `run_on_limo` uses the real `/hardware_s
 
 ### 4.7 Running on the LIMO (`run_on_limo.m`)
 
-1. It creates the ROS 2 node `/matlab_limo_controller` on `P.ros.domain_id`, subscribes to `/hardware_odom` and `/hardware_scan`, and publishes `/cmd_vel`.
+1. It creates the ROS 2 node `/matlab_limo_controller` on `P.ros.domain_id`, subscribes to `/hardware_odom` and `/hardware_scan`, and publishes on `P.ros.cmd_topic` (`/limo1/cmd_vel` by default, the namespaced LIMO).
 2. It waits up to 15 s for odometry (is the bridge running?). Then it publishes the path once on `/reference_path` (`P.ros.publish_path`), so the Python `live_plotter` can show it.
 3. Loop at the controller rate: the latest odometry is used as the pose. It is re-zeroed only if `P.ros.rezero_odom` is true; the default is false, so the drawn path is in the PhaseSpace frame. Then come the errors, the controller, the safety filter on the real scan, and `/cmd_vel` with `linear.x = v` and `angular.z = v·tan(delta)/L`.
 4. It ends when an open path is finished, `P.ros.duration` elapses (0 = no limit), the live figure is closed, or on Ctrl-C. A **zero Twist is always sent** at the end, via `onCleanup`.
@@ -252,6 +252,7 @@ Do **not** run a Python controller at the same time: both would publish `/cmd_ve
 | `sim.start_offset` | [0 0.10 10°] | Initial error [along, left, yaw] |
 | `sim.laps`, `sim.t_max` | 1, 120 s | Run length |
 | `ros.domain_id` | 0 | ROS_DOMAIN_ID |
+| `ros.cmd_topic` | `/limo1/cmd_vel` | The LIMO's velocity topic (`ros2 topic list` on the robot); `/cmd_vel` if it has no namespace |
 | `ros.rezero_odom` | false | Path relative to the start pose (true) or PhaseSpace frame (false) |
 | `ros.publish_path` | true | Publish the path on `/reference_path` |
 | `ros.duration` | 0 | Time limit on hardware (0 = none) |

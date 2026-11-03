@@ -51,6 +51,7 @@ P.sim.t_max        = 120;                % hard time limit (s)
 
 % ---------------------------------------------------------------- ROS 2 (hardware)
 P.ros.domain_id    = 0;                  % must match the LIMO / base station
+P.ros.cmd_topic    = '/limo1/cmd_vel';   % LIMO's velocity topic (namespaced robot); '/cmd_vel' if none
 P.ros.rezero_odom  = false;              % false = path in the PhaseSpace frame
 P.ros.publish_path = true;               % also publish the path on /reference_path
 P.ros.duration     = 0;                  % 0 = until the path end or figure closed

@@ -53,11 +53,20 @@ source install/setup.bash
 
 Because the control stack runs off-board, the base station and the LIMO must share the same `ROS_DOMAIN_ID`.
 
+> [!IMPORTANT]
+> **The LIMO's topics are namespaced.** On the lab robot, `ros2 topic list` shows `/limo1/cmd_vel`, `/limo1/imu`, and so on. The nodes publish to `/cmd_vel`, so they must be remapped, otherwise the robot never receives a command and simply does not move. Both launch files do this through `robot_ns` (default **`limo1`**):
+> *   `robot_ns:=limo2` for another robot
+> *   `robot_ns:=none` for a robot without a namespace (plain `/cmd_vel`)
+>
+> With `ros2 run`, add the remap yourself: `--ros-args -r /cmd_vel:=/limo1/cmd_vel` (and `-r /imu:=/limo1/imu` for PID/LQR/MPC; it is unused, so optional). In MATLAB set `P.ros.cmd_topic`. Only `/cmd_vel` and `/imu` belong to the robot; `/hardware_odom`, `/hardware_scan`, `/hardware_obstacles` and `/reference_path` come from this package and are never remapped.
+>
+> Check: `ros2 node info /nmpc_tracker_node` must list `/limo1/cmd_vel` under *Publishers*.
+
 ### Quick start (one terminal)
 
 ```bash
 source install/setup.bash
-ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:=false
+ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:=false   # /cmd_vel -> /limo1/cmd_vel (robot_ns default)
 ```
 
 This starts the bridge, the controller, the builder and the live plotter. Draw a path in the builder, click **Smooth Path**, then **Publish**. With the lab obstacle:
@@ -75,8 +84,8 @@ ros2 run limo_mocap_suite phasespace_bridge --ros-args -p "obstacles:=[1.970681,
 
 **2. A controller.** It idles until a path arrives.
 ```bash
-ros2 run limo_mocap_suite nmpc_tracker --ros-args -p rezero_odom:=false
-# alternatives: pid_tracker, lqr_tracker, mpc_tracker
+ros2 run limo_mocap_suite nmpc_tracker --ros-args -p rezero_odom:=false -r /cmd_vel:=/limo1/cmd_vel
+# alternatives: pid_tracker, lqr_tracker, mpc_tracker (same -r remap; add -r /imu:=/limo1/imu if you like)
 ```
 
 **3. Path builder.**
@@ -103,10 +112,12 @@ ros2 run limo_mocap_suite live_plotter --ros-args -p rezero_odom:=false
 Checks that the LIMO's wheels do what `/cmd_vel` says, before any closed-loop run. Lift the robot so its wheels spin freely (or put it on the floor: it just drives the path blind), stand **behind** it, and compare with the screen.
 
 ```bash
-ros2 run limo_mocap_suite limo_test_suite
-# or start straight away, slower, a specific path:
-ros2 run limo_mocap_suite limo_test_suite --ros-args -p path:=circle -p speed:=0.15 -p autostart:=true
+ros2 launch limo_mocap_suite limo_test.launch.py                       # sends to /limo1/cmd_vel
+ros2 launch limo_mocap_suite limo_test.launch.py path:=circle speed:=0.15 robot_ns:=limo1
+# or without launch (remap yourself), starting straight away:
+ros2 run limo_mocap_suite limo_test_suite --ros-args -r /cmd_vel:=/limo1/cmd_vel -p path:=circle -p speed:=0.15 -p autostart:=true
 ```
+`limo_test.launch.py` arguments: `robot_ns` (default `limo1`, `none` = plain `/cmd_vel`), `path` (default `figure8`), `speed` (default `0.20`).
 
 *   Pick a path with the radio buttons (**straight**, **circle**, **figure8**, **drawn**), then press **Start**. After a 3 s countdown the commands begin. **STOP** (or closing the window, or Ctrl-C) sends zero velocity immediately.
 *   **Left panel, view from behind:** forward (+X) points **up** and left (+Y) points **left**, so the screen matches the robot in front of you. The grey dashed line is the test path and the orange line is the motion the commands produce. The robot glyph's arrow points along the last traced segment; it starts pointing straight up and turns with the path, as an Ackermann robot would.
@@ -141,6 +152,7 @@ The commands depend only on the path, `speed`, `wheelbase` and `max_steer`; plac
 | `run_duration` | `0.0` | seconds | Controller time limit; `0` = until the path end or Ctrl-C |
 | `obstacles` | `''` | `"[x, y, r, ...]"` | Bridge obstacle map; empty = the bridge default (simulation arena) |
 | `lab_x`, `lab_y` | `''` | `"[min, max]"` | Lab extents for both GUIs; empty = `[-0.5, 8.0]` and `[-1.0, 6.0]` |
+| `robot_ns` | `limo1` | name, or `none` | Namespace of the LIMO's topics: the controller's `/cmd_vel` → `/<robot_ns>/cmd_vel`, `/imu` → `/<robot_ns>/imu`; `none` = no namespace |
 
 ### Node parameters (`--ros-args -p name:=value`)
 
@@ -204,7 +216,8 @@ Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) 
 | `/hardware_obstacles` | `std_msgs/Float32MultiArray` (latched, flat `[x, y, r, ...]`) | bridge → builder, plotter |
 | `/reference_path` | `nav_msgs/Path` | builder → controllers, plotter |
 | `/reference_path_viz` | `nav_msgs/Path` | controllers → RViz (every 5th point) |
-| `/cmd_vel` | `geometry_msgs/Twist` | controller → LIMO |
+| `/<robot_ns>/cmd_vel` (e.g. `/limo1/cmd_vel`) | `geometry_msgs/Twist` | controller / test suite → LIMO (nodes publish `/cmd_vel`, remapped by the launch files) |
+| `/<robot_ns>/imu` | `sensor_msgs/Imu` | LIMO → PID/LQR/MPC (unused) |
 
 ## GUIs
 

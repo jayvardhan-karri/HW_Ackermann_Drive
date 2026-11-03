@@ -15,7 +15,8 @@ function result = run_on_limo(ref, name, P, opts)
 %     1. latest /hardware_odom -> pose (optionally re-zeroed, P.ros.rezero_odom)
 %     2. tracking_errors -> controller step -> delta, v
 %     3. LiDAR safety filter on the latest /hardware_scan (if any)
-%     4. publish /cmd_vel: linear.x = v, angular.z = v*tan(delta)/L
+%     4. publish P.ros.cmd_topic (default /limo1/cmd_vel, the namespaced
+%        LIMO): linear.x = v, angular.z = v*tan(delta)/L
 %   Ends when an open path is finished, P.ros.duration elapses (0 = no
 %   limit), the live figure is closed, or Ctrl-C. A zero Twist is ALWAYS
 %   sent at the end (onCleanup), whatever the reason.
@@ -30,7 +31,7 @@ dt = 1 / c.rate_hz;
 node = ros2node('/matlab_limo_controller', P.ros.domain_id);
 odomSub = ros2subscriber(node, '/hardware_odom', 'nav_msgs/Odometry');
 scanSub = ros2subscriber(node, '/hardware_scan', 'sensor_msgs/LaserScan');
-cmdPub  = ros2publisher(node, '/cmd_vel', 'geometry_msgs/Twist');
+cmdPub  = ros2publisher(node, P.ros.cmd_topic, 'geometry_msgs/Twist');   % e.g. /limo1/cmd_vel
 cleanup = onCleanup(@() stop_robot(cmdPub)); %#ok<NASGU>
 if P.ros.publish_path
     pathPub = ros2publisher(node, '/reference_path', 'nav_msgs/Path');

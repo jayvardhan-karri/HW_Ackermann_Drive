@@ -15,6 +15,9 @@
 #         obstacles          "[x, y, r, ...]" for the bridge; '' = bridge default
 #         lab_x, lab_y       "[min, max]" lab extents for both GUIs; '' = default
 #                            ([-0.5, 8.0] and [-1.0, 6.0])
+#         robot_ns           namespace of the LIMO's own topics (default limo1):
+#                            /cmd_vel -> /<robot_ns>/cmd_vel, /imu -> /<robot_ns>/imu
+#                            for the controller; none = no namespace (plain /cmd_vel)
 #
 # TAG LEGEND (grep for these to jump / skip):
 #   [CORE]   control / estimation math that decides robot motion
@@ -31,6 +34,8 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import yaml
 
+from limo_mocap_suite.robot_topics import DEFAULT_ROBOT_NS, robot_remappings
+
 CONTROLLERS = ('pid', 'lqr', 'mpc', 'nmpc')
 
 
@@ -38,7 +43,8 @@ CONTROLLERS = ('pid', 'lqr', 'mpc', 'nmpc')
 # [LIFE]   _controller_node(context)
 # -----------------------------------------------------------------------------
 # Resolves the 'controller' argument at launch time and returns the matching
-# <controller>_tracker Node with rezero_odom / run_duration forwarded.
+# <controller>_tracker Node with rezero_odom / run_duration forwarded and
+# /cmd_vel, /imu remapped into robot_ns (robot_remappings).
 # Raises on an unknown controller name.
 # =============================================================================
 def _controller_node(context):
@@ -53,6 +59,7 @@ def _controller_node(context):
         output='screen',
         emulate_tty=True,
         parameters=[{'rezero_odom': rezero, 'run_duration': duration}],
+        remappings=robot_remappings(LaunchConfiguration('robot_ns').perform(context)),
     )]
 
 
@@ -127,6 +134,8 @@ def generate_launch_description():
                               description='GUI lab X extent "[min, max]" (empty = default)'),
         DeclareLaunchArgument('lab_y', default_value='',
                               description='GUI lab Y extent "[min, max]" (empty = default)'),
+        DeclareLaunchArgument('robot_ns', default_value=DEFAULT_ROBOT_NS,
+                              description="LIMO topic namespace: /cmd_vel -> /<robot_ns>/cmd_vel (none = no namespace)"),
 
         OpaqueFunction(function=_bridge_node),
         OpaqueFunction(function=_controller_node),
