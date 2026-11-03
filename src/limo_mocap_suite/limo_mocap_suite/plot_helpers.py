@@ -26,7 +26,7 @@ import signal
 import threading
 
 import rclpy
-from rclpy.signals import SignalHandlerOptions
+from limo_mocap_suite.ros_compat import init_ros
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.ticker import FuncFormatter, MultipleLocator
@@ -58,13 +58,13 @@ def quat_to_yaw(q):
 # =============================================================================
 # [LIFE]   init_gui_ros(args)
 # -----------------------------------------------------------------------------
-# rclpy.init for a GUI node with plain Python SIGINT handling, and Ctrl-C
+# init_ros (plain Python SIGINT handling on Foxy and Humble), and Ctrl-C
 # mapped to "close all windows". plt.show() then returns normally and the
 # node's cleanup (zero Twist, destroy, shutdown) runs, also under ros2 launch.
 # The GUIs' timers (5-10 Hz) let Python see the signal while Tk is idle.
 # =============================================================================
 def init_gui_ros(args=None):
-    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    init_ros(args)
     signal.signal(signal.SIGINT, lambda *_: plt.close('all'))
 
 

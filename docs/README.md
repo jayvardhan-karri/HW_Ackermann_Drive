@@ -14,6 +14,7 @@ The package is modular, separating trajectory generation, state estimation, safe
 *   **`interactive_builder.py`**: A Matplotlib-based GUI. Click and drag to draw a path, apply B-spline smoothing, and publish it to `/reference_path`. It shows the live robot pose and heading and the obstacles while you draw.
 *   **`live_plotter_node.py`**: A Matplotlib-based live view of a run: reference path, robot trail, robot glyph with heading, and obstacles.
 *   **`limo_test_suite.py`**: Open-loop actuator test with a GUI. It plays a test path (straight, left circle, figure-8, or a drawn path) as `/cmd_vel` commands and shows, from behind the robot, where the LIMO should go and how its front wheels should be steered. No MoCap or feedback needed; the robot can sit with its wheels in the air.
+*   **`ros_compat.py`**: Foxy / Humble shim (`init_ros`), so the same code runs on both.
 *   **`plot_helpers.py`**: Shared drawing code for the GUIs: lab grid with red axes for the projector, robot glyph, obstacles, controller frame, Ctrl-C handling.
 *   **`trajectory_subscriber.py`**: A mathematical utility class used by all controllers. It subscribes to `/reference_path` and calculates local derivatives (curvature $\kappa$ and reference velocity $v_{\text{ref}}$). It also detects whether the path is a closed loop or an open path.
 *   **`lidar_safety.py`**: The Artificial Potential Field (APF) safety layer, used by all four controllers. Scales velocity down near obstacles and applies repulsive steering vectors based on laser scan data.
@@ -25,10 +26,19 @@ The package is modular, separating trajectory generation, state estimation, safe
 
 ## Prerequisites
 
-*   **OS:** Ubuntu 22.04 LTS
-*   **ROS 2:** Humble Hawksbill
+*   **OS / ROS 2:** Ubuntu 22.04 + Humble, or Ubuntu 20.04 + Foxy
 *   **Python Dependencies:** `numpy`, `scipy`, `matplotlib`
 *   **`phasespace_msgs`:** the lab's PhaseSpace message package must be built and sourced (the bridge imports `phasespace_msgs.msg.Markers`).
+
+## ROS 2 Foxy / Python 3.8
+
+The package runs unchanged on **Foxy (Ubuntu 20.04, Python 3.8)** and **Humble (Ubuntu 22.04, Python 3.10)**. On a new machine:
+```bash
+source /opt/ros/foxy/setup.bash      # or humble
+python3 tools/check_deps.py          # what is installed / missing (installs nothing)
+./tools/setup_ros2.sh                # apt-installs what is missing (asks first), builds, re-checks
+```
+Do **not** install Python 3.10 for Foxy: Foxy's `rclpy` only works with Python 3.8. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full dependency list, what was changed, and how it was tested.
 
 ## Build Instructions
 

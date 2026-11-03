@@ -24,7 +24,6 @@ import time
 import numpy as np
 
 import rclpy
-from rclpy.signals import SignalHandlerOptions
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry, Path
@@ -33,6 +32,7 @@ from sensor_msgs.msg import LaserScan, Imu
 
 from limo_mocap_suite.trajectory_subscriber import TrajectorySubscriber
 from limo_mocap_suite.lidar_safety import LidarSafetyFilter
+from limo_mocap_suite.ros_compat import init_ros
 
 
 # =============================================================================
@@ -353,7 +353,7 @@ class PidTrackerNode(Node):
 def main(args=None):
     # Plain Python SIGINT handling: Ctrl-C raises KeyboardInterrupt but keeps the
     # ROS context alive, so the shutdown code below can still publish.
-    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    init_ros(args)  # Foxy + Humble: context stays alive on Ctrl-C
     node = PidTrackerNode()
     try:
         rclpy.spin(node)
