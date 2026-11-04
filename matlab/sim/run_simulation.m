@@ -10,14 +10,14 @@ function log = run_simulation(ref, name, P)
 %   Each control tick (same order as the Python control_loop):
 %     1. tracking_errors  -> cte, herr, look-ahead row, nearest
 %     2. controller step  -> delta, v
-%     3. LiDAR safety (synthetic scan of P.obstacles) if P.safety.enabled
+%     3. CBF safety filter (cbf_filter) on the known obstacles P.obstacles
 %     4. clip delta, remember it as the applied steering (mem.prev_steer)
 %   Start   : path start + P.sim.start_offset ([along, left, yaw] error).
 %   End     : open path -> goal reached; closed -> P.sim.laps laps (time
 %             estimate); always <= P.sim.t_max.
 %
 %   log fields (one row per control tick): t, x, y, yaw, v, delta, omega,
-%   cte, herr, x_ref, y_ref, dmin, status (cellstr), solve_ms; plus
+%   cte, herr, x_ref, y_ref, clearance, status (cellstr), solve_ms; plus
 %   controller label, goal flag, ref.
 c = controller_registry(name, P);
 ctrl_dt = 1 / c.rate_hz;
@@ -35,10 +35,10 @@ end
 n_ctrl = ceil(t_end / ctrl_dt) + 1;
 Z = nan(n_ctrl, 1);
 log = struct('t', Z, 'x', Z, 'y', Z, 'yaw', Z, 'v', Z, 'delta', Z, 'omega', Z, ...
-             'cte', Z, 'herr', Z, 'x_ref', Z, 'y_ref', Z, 'dmin', Z, 'solve_ms', Z);
+             'cte', Z, 'herr', Z, 'x_ref', Z, 'y_ref', Z, 'clearance', Z, 'solve_ms', Z);
 log.status = cell(n_ctrl, 1);
 
-mem = struct(); last_idx = 1; delta_act = 0; v_cmd = 0; delta_cmd = 0;
+side = []; mem = struct(); last_idx = 1; delta_act = 0; v_cmd = 0; delta_cmd = 0;
 k = 0; step = 0; t = 0; goal = false;
 while t <= t_end
     if mod(step, hold_steps) == 0
@@ -47,11 +47,7 @@ while t <= t_end
         tic;
         [delta_cmd, v_cmd, mem] = c.step(err, pose, ref, mem, P, ctrl_dt);
         solve_ms = toc * 1000;
-        dmin = inf; status = 'OFF';
-        if P.safety.enabled
-            [rg, an] = synthetic_scan(pose, P.obstacles);
-            [v_cmd, delta_cmd, dmin, status] = lidar_safety_filter(v_cmd, delta_cmd, rg, an, P.safety);
-        end
+        [v_cmd, delta_cmd, clearance, status, side] = cbf_filter(v_cmd, delta_cmd, pose, P.obstacles, P, side);
         delta_cmd = min(max(delta_cmd, -P.max_steer), P.max_steer);
         mem.prev_steer = delta_cmd;
         k = k + 1;
@@ -59,7 +55,7 @@ while t <= t_end
         log.v(k) = v_cmd; log.delta(k) = delta_cmd; log.omega(k) = v_cmd * tan(delta_cmd) / P.L;
         log.cte(k) = err.cte; log.herr(k) = err.herr;
         log.x_ref(k) = err.la(1); log.y_ref(k) = err.la(2);
-        log.dmin(k) = dmin; log.status{k} = status; log.solve_ms(k) = solve_ms;
+        log.clearance(k) = clearance; log.status{k} = status; log.solve_ms(k) = solve_ms;
     end
     if P.sim.steer_tau > 0
         delta_act = delta_act + (delta_cmd - delta_act) * min(1, P.sim.dt / P.sim.steer_tau);

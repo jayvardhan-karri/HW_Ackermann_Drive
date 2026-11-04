@@ -8,11 +8,13 @@
 # Args  : controller         pid | lqr | mpc | nmpc          (default nmpc)
 #         builder            true | false: start the drawing GUI (default true)
 #         plotter            true | false: start the live plotter (default true)
-#         use_synthetic_scan true | false: bridge fakes /hardware_scan (true)
 #         rezero_odom        true | false: path relative to start pose (true);
 #                            forwarded to the controller AND both GUIs
 #         run_duration       seconds, 0 = until the path end / Ctrl-C (0.0)
-#         obstacles          "[x, y, r, ...]" for the bridge; '' = bridge default
+#         obstacles          "[x, y, r, ...]" fixed cylinders (default: none)
+#         obstacle_markers   "[(0,1,2,3),(4,5,6,7)]" 4 rim markers per cylinder (none)
+#         robot_radius, safety_margin, cbf_alpha  CBF clearance (0.20, 0.10, 0.6)
+#         cbf_max_steer      steering the CBF plans with; 0 = max_steer (0.0)
 #         lab_x, lab_y       "[min, max]" lab extents for both GUIs; '' = default
 #                            ([-0.5, 8.0] and [-1.0, 6.0])
 #         ref_offset         marker midpoint ahead of the rear axle in m (0.10);
@@ -36,6 +38,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import yaml
 
+from limo_mocap_suite.obstacle_cbf import parse_marker_groups, parse_obstacles
 from limo_mocap_suite.robot_topics import DEFAULT_ROBOT_NS, robot_remappings
 
 CONTROLLERS = ('pid', 'lqr', 'mpc', 'nmpc')
@@ -56,12 +59,15 @@ def _controller_node(context):
     rezero = LaunchConfiguration('rezero_odom').perform(context).lower() == 'true'
     duration = float(LaunchConfiguration('run_duration').perform(context))
     offset = float(LaunchConfiguration('ref_offset').perform(context))
+    params = {'rezero_odom': rezero, 'run_duration': duration, 'ref_offset': offset}
+    for arg in ('robot_radius', 'safety_margin', 'cbf_alpha', 'cbf_max_steer'):
+        params[arg] = float(LaunchConfiguration(arg).perform(context))
     return [Node(
         package='limo_mocap_suite',
         executable=f'{name}_tracker',
         output='screen',
         emulate_tty=True,
-        parameters=[{'rezero_odom': rezero, 'run_duration': duration, 'ref_offset': offset}],
+        parameters=[params],
         remappings=robot_remappings(LaunchConfiguration('robot_ns').perform(context)),
     )]
 
@@ -69,16 +75,17 @@ def _controller_node(context):
 # =============================================================================
 # [LIFE]   _bridge_node(context)
 # -----------------------------------------------------------------------------
-# Returns the phasespace_bridge Node. use_synthetic_scan is forwarded; the
-# 'obstacles' string is parsed as YAML ("[1.97, 0.81, 0.35]") and forwarded
-# only when non-empty, so '' keeps the bridge's built-in default map.
+# Returns the phasespace_bridge Node with the 'obstacles' and 'obstacle_markers'
+# strings, each forwarded only when non-empty. Bad values fail here, at launch.
 # =============================================================================
 def _bridge_node(context):
-    params = {'use_synthetic_scan':
-              LaunchConfiguration('use_synthetic_scan').perform(context).lower() == 'true'}
-    obstacles = LaunchConfiguration('obstacles').perform(context).strip()
+    params = {}
+    obstacles = parse_obstacles(LaunchConfiguration('obstacles').perform(context).strip())
     if obstacles:
-        params['obstacles'] = [float(v) for v in yaml.safe_load(obstacles)]
+        params['obstacles'] = obstacles
+    markers = LaunchConfiguration('obstacle_markers').perform(context).strip()
+    if parse_marker_groups(markers):
+        params['obstacle_markers'] = markers
     return [Node(
         package='limo_mocap_suite',
         executable='phasespace_bridge',
@@ -112,7 +119,7 @@ def _gui_nodes(context):
 # [LIFE]   generate_launch_description()
 # -----------------------------------------------------------------------------
 # Declares the launch arguments, then starts:
-# 1. phasespace_bridge (via _bridge_node: use_synthetic_scan, obstacles),
+# 1. phasespace_bridge (via _bridge_node: obstacles, obstacle_markers),
 # 2. the selected controller (via _controller_node),
 # 3. interactive_builder if builder:=true, live_plotter if plotter:=true
 #    (via _gui_nodes: rezero_odom, lab_x, lab_y).
@@ -125,14 +132,22 @@ def generate_launch_description():
                               description='Start the interactive path builder GUI'),
         DeclareLaunchArgument('plotter', default_value='true',
                               description='Start the live plotter GUI'),
-        DeclareLaunchArgument('use_synthetic_scan', default_value='true',
-                              description='Bridge publishes a ray-cast /hardware_scan'),
         DeclareLaunchArgument('rezero_odom', default_value='true',
                               description='Interpret the path relative to the start pose'),
         DeclareLaunchArgument('run_duration', default_value='0.0',
                               description='Run time limit in seconds (0 = none)'),
         DeclareLaunchArgument('obstacles', default_value='',
-                              description='Bridge obstacle map "[x, y, r, ...]" (empty = default)'),
+                              description='Fixed cylinders "[x, y, r, ...]" (empty = none)'),
+        DeclareLaunchArgument('obstacle_markers', default_value='',
+                              description='4 rim markers per cylinder "[(0,1,2,3),(4,5,6,7)]" (empty = none)'),
+        DeclareLaunchArgument('robot_radius', default_value='0.20',
+                              description='Body radius around the tracked point (m)'),
+        DeclareLaunchArgument('safety_margin', default_value='0.10',
+                              description='Extra clearance beyond the body (m)'),
+        DeclareLaunchArgument('cbf_max_steer', default_value='0.0',
+                              description='Steering limit for the CBF (rad); 0 = max_steer'),
+        DeclareLaunchArgument('cbf_alpha', default_value='0.6',
+                              description='CBF gain (1/s)'),
         DeclareLaunchArgument('lab_x', default_value='',
                               description='GUI lab X extent "[min, max]" (empty = default)'),
         DeclareLaunchArgument('lab_y', default_value='',

@@ -10,15 +10,15 @@ A hardware-agnostic, off-board trajectory tracking suite for the AgileX LIMO. Th
 
 The package is modular, separating trajectory generation, state estimation, safety, and control math:
 
-*   **`phasespace_bridge.py`**: The Hardware Abstraction Layer. Subscribes to `/phasespace/markers` (`phasespace_msgs/Markers`), computes the LIMO's centroid and yaw (marker 1 → marker 0), and publishes `/hardware_odom`. It also generates a synthetic `/hardware_scan` from the obstacle map and publishes that map on `/hardware_obstacles`, so the GUIs draw the same obstacles.
+*   **`phasespace_bridge.py`**: The Hardware Abstraction Layer. Subscribes to `/phasespace/markers` (`phasespace_msgs/Markers`), finds markers by their `id`, computes the LIMO's centroid and yaw (marker 1 → marker 0), and publishes `/hardware_odom`. It also builds the obstacle map, from a flat list and/or live from rim markers, and publishes it on `/hardware_obstacles`.
 *   **`interactive_builder.py`**: A Matplotlib-based GUI. Click and drag to draw a path, apply B-spline smoothing, and publish it to `/reference_path`. It shows the live robot pose and heading and the obstacles while you draw.
 *   **`live_plotter_node.py`**: A Matplotlib-based live view of a run: reference path, robot trail, robot glyph with heading, and obstacles.
 *   **`limo_test_suite.py`**: Open-loop actuator test with a GUI. It plays a test path (straight, left circle, figure-8, or a drawn path) as `/cmd_vel` commands and shows, from behind the robot, where the LIMO should go and how its front wheels should be steered. No MoCap or feedback needed; the robot can sit with its wheels in the air.
 *   **`ros_compat.py`**: Foxy / Humble shim (`init_ros`), so the same code runs on both.
 *   **`plot_helpers.py`**: Shared drawing code for the GUIs: lab grid with red axes for the projector, robot glyph, obstacles, controller frame, Ctrl-C handling.
 *   **`trajectory_subscriber.py`**: A mathematical utility class used by all controllers. It subscribes to `/reference_path` and calculates local derivatives (curvature $\kappa$ and reference velocity $v_{\text{ref}}$). It also detects whether the path is a closed loop or an open path.
-*   **`lidar_safety.py`**: The Artificial Potential Field (APF) safety layer, used by all four controllers. Scales velocity down near obstacles and applies repulsive steering vectors based on laser scan data.
-*   **Controllers** (subscribe to `/hardware_odom` and `/hardware_scan`):
+*   **`obstacle_cbf.py`**: The Control Barrier Function (CBF) safety filter, used by all four controllers. Using the known obstacle positions (no LiDAR), it adjusts speed and steering by the smallest amount that keeps the robot clear, going around obstacles on the path.
+*   **Controllers** (subscribe to `/hardware_odom` and `/hardware_obstacles`):
     *   **`pid_tracker_node.py`**: Kinematic Ackermann PID with Curvature Feedforward.
     *   **`lqr_tracker_node.py`**: Infinite-Horizon Continuous Algebraic Riccati Equation (ARE) tracker.
     *   **`mpc_tracker_node.py`**: Linear Time-Varying (LTV) MPC, solved by backward Riccati recursion.
@@ -40,6 +40,29 @@ python3 tools/check_deps.py          # what is installed / missing (installs not
 ```
 Do **not** install Python 3.10 for Foxy: Foxy's `rclpy` only works with Python 3.8. See [COMPATIBILITY.md](COMPATIBILITY.md) for the full dependency list, what was changed, and how it was tested.
 
+## Obstacle avoidance (CBF)
+
+There are **no obstacles by default**. Give them on launch as a flat list, by rim markers, or both:
+```bash
+ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:=false obstacles:="[1.97, 0.81, 0.35]"
+ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:=false obstacle_markers:="[(2,3,4,5),(6,7,8,9)]"
+```
+*   **Rim markers:** 4 markers evenly spaced around the top edge of each cylinder. Centre = mean of the 4, radius = mean distance from the centre, updated live if the obstacle moves. If a marker is occluded, the last known circle is kept. A group must be fully tracked once before it exists, and the bridge warns until then, so **check that the obstacle appears on the live plotter before driving**.
+*   **Behaviour:** the robot keeps its tracked point `robot_radius + safety_margin` (0.30 m) from each cylinder's edge, goes around an obstacle on its path, and rejoins. It stops (`CBF_STOP`) only if there is no safe way forward. Telemetry logs `min_clearance` and `safety_status`.
+*   **Space needed:** the LIMO cannot turn on the spot, so going around needs room. A gap narrower than about 0.6 m between obstacles, or an obstacle against a wall, can make it stop.
+*   **Why a filter and not the MPC itself:** neither MPC here has obstacle constraints. The LTV-MPC is an unconstrained Riccati solution, and the NMPC bounds only the steering. The CBF adds the safety constraint to all four controllers in the same way.
+
+## `phasespace_msgs`
+
+The bridge imports `phasespace_msgs`, so **the machine running `phasespace_bridge` must have it built and sourced**. ROS 2 does not learn message definitions over the network. So:
+*   Same machine as `phasespace_bringup`: source that workspace, and no copy is needed.
+*   Different machine: build just the `phasespace_msgs` folder there, from the **`mocap-ros2` branch** of [phasespace-mocap-ros](https://github.com/FocasLab/phasespace-mocap-ros/tree/mocap-ros2) (`main` is ROS 1).
+
+`python3 tools/check_deps.py` tells you whether it is found. Marker fields are in metres, already converted by the bringup node.
+
+> [!WARNING]
+> **Check the direction of yaw once in the lab.** The bringup node maps markers as `x = m.x`, `y = m.z`, `z = m.y` with no sign change, unlike its rigid bodies, which use `y = -z`. Depending on the lab's calibration, marker coordinates could be mirrored. Rotate the robot counter-clockwise by hand (seen from above) and watch `ros2 topic echo /hardware_odom`: **the yaw must increase**. If it decreases, every controller would steer the wrong way. Do not drive until this is resolved.
+
 ## Build Instructions
 
 Ensure you are in the root of your hardware workspace (e.g., `HW_Ackermann_Drive`):
@@ -58,7 +81,7 @@ Because the control stack runs off-board, the base station and the LIMO must sha
 > *   `robot_ns:=limo2` for another robot
 > *   `robot_ns:=none` for a robot without a namespace (plain `/cmd_vel`)
 >
-> With `ros2 run`, add the remap yourself: `--ros-args -r /cmd_vel:=/limo1/cmd_vel` (and `-r /imu:=/limo1/imu` for PID/LQR/MPC; it is unused, so optional). In MATLAB set `P.ros.cmd_topic`. Only `/cmd_vel` and `/imu` belong to the robot; `/hardware_odom`, `/hardware_scan`, `/hardware_obstacles` and `/reference_path` come from this package and are never remapped.
+> With `ros2 run`, add the remap yourself: `--ros-args -r /cmd_vel:=/limo1/cmd_vel` (and `-r /imu:=/limo1/imu` for PID/LQR/MPC; it is unused, so optional). In MATLAB set `P.ros.cmd_topic`. Only `/cmd_vel` and `/imu` belong to the robot; `/hardware_odom`, `/hardware_obstacles` and `/reference_path` come from this package and are never remapped.
 >
 > Check: `ros2 node info /nmpc_tracker_node` must list `/limo1/cmd_vel` under *Publishers*.
 
@@ -84,7 +107,7 @@ ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:
 
 **1. PhaseSpace bridge**
 ```bash
-ros2 run limo_mocap_suite phasespace_bridge --ros-args -p "obstacles:=[1.970681, 0.80659, 0.35]"
+ros2 run limo_mocap_suite phasespace_bridge --ros-args -p "obstacles:=[1.970681, 0.80659, 0.35]" -p "obstacle_markers:=[2,3,4,5]"
 ```
 
 **2. A controller.** It idles until a path arrives.
@@ -152,10 +175,13 @@ The commands depend only on the path, `speed`, `wheelbase` and `max_steer`; plac
 | `controller` | `nmpc` | `pid`, `lqr`, `mpc`, `nmpc` | Which tracker to start |
 | `builder` | `true` | `true`, `false` | Start `interactive_builder` |
 | `plotter` | `true` | `true`, `false` | Start `live_plotter` |
-| `use_synthetic_scan` | `true` | `true`, `false` | Bridge publishes the ray-cast `/hardware_scan` |
 | `rezero_odom` | `true` | `true`, `false` | Forwarded to the controller, the builder and the plotter |
 | `run_duration` | `0.0` | seconds | Controller time limit; `0` = until the path end or Ctrl-C |
-| `obstacles` | `''` | `"[x, y, r, ...]"` | Bridge obstacle map; empty = the bridge default (simulation arena) |
+| `obstacles` | `''` (none) | `"[x, y, r, ...]"` | Fixed cylinders, flat list, metres, PhaseSpace frame |
+| `obstacle_markers` | `''` (none) | `"[(0,1,2,3),(4,5,6,7)]"` | 4 marker ids on the rim of each cylinder; centre and radius come live from them |
+| `robot_radius`, `safety_margin` | `0.20`, `0.10` | metres | Clearance from the tracked point to a cylinder edge = their sum |
+| `cbf_alpha` | `0.6` | 1/s | CBF gain; lower slows down earlier |
+| `cbf_max_steer` | `0.0` | rad | Steering limit the CBF plans with; `0` = `max_steer`. Lower it if the robot's real tightest turn is wider |
 | `lab_x`, `lab_y` | `''` | `"[min, max]"` | Lab extents for both GUIs; empty = `[-0.5, 8.0]` and `[-1.0, 6.0]` |
 | `ref_offset` | `0.10` | metres | Marker midpoint ahead of the rear axle; forwarded to the controller |
 | `robot_ns` | `limo1` | name, or `none` | Namespace of the LIMO's topics: the controller's `/cmd_vel` → `/<robot_ns>/cmd_vel`, `/imu` → `/<robot_ns>/imu`; `none` = no namespace |
@@ -168,8 +194,8 @@ The commands depend only on the path, `speed`, `wheelbase` and `max_steer`; plac
 |---|---|---|
 | `front_id` | `0` | Index of the **front** marker in `msg.markers` |
 | `rear_id` | `1` | Index of the **rear** marker. Heading = rear → front |
-| `use_synthetic_scan` | `true` | Publish the ray-cast `/hardware_scan` |
-| `obstacles` | simulation arena | Flat list `[x, y, r, x, y, r, ...]` in metres, PhaseSpace frame. Radius ≥ 100 m is drawn as a wall. The default is 4 pillars at (±2.5, ±1.5), r 0.15, plus walls at ±5 m. |
+| `obstacles` | none | Flat list `[x, y, r, ...]` in metres, PhaseSpace frame: `-p "obstacles:=[1.97, 0.81, 0.35]"` |
+| `obstacle_markers` | none | 4 rim markers per cylinder. With `ros2 launch`, write `obstacle_markers:="[(0,1,2,3),(4,5,6,7)]"`. With `ros2 run`, ROS's parser rejects bare tuples, so use a flat list `-p "obstacle_markers:=[0,1,2,3,4,5,6,7]"` or quote it `-p "obstacle_markers:='[(0,1,2,3),(4,5,6,7)]'"` |
 
 Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) are skipped.
 
@@ -178,6 +204,9 @@ Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `v_nominal` | `0.40` | Cruise speed (m/s); reduced automatically in curves |
+| `robot_radius`, `safety_margin` | `0.20`, `0.10` | CBF clearance from the tracked point to a cylinder edge = their sum (m) |
+| `cbf_alpha`, `cbf_max_steer` | `0.6`, `0.0` | CBF gain (1/s); steering limit it plans with (rad, `0` = `max_steer`) |
+| `obstacles` | none | Extra fixed cylinders for this controller, added to `/hardware_obstacles` |
 | `wheelbase` | `0.20` | LIMO wheelbase L (m) |
 | `ref_offset` | `0.10` | Distance of the marker midpoint **ahead of the rear axle** (m). Measure it on your robot: 0.10 assumes the midpoint is halfway between the axles |
 | `max_steer` | `0.48869` | Steering limit (rad, 28°) |
@@ -219,8 +248,7 @@ Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) 
 |---|---|---|
 | `/phasespace/markers` | `phasespace_msgs/Markers` | PhaseSpace driver → bridge |
 | `/hardware_odom` | `nav_msgs/Odometry` | bridge → controllers, builder, plotter |
-| `/hardware_scan` | `sensor_msgs/LaserScan` | bridge → controllers |
-| `/hardware_obstacles` | `std_msgs/Float32MultiArray` (latched, flat `[x, y, r, ...]`) | bridge → builder, plotter |
+| `/hardware_obstacles` | `std_msgs/Float32MultiArray` (latched, flat `[x, y, r, ...]`) | bridge → controllers (CBF), builder, plotter |
 | `/reference_path` | `nav_msgs/Path` | builder → controllers, plotter |
 | `/reference_path_viz` | `nav_msgs/Path` | controllers → RViz (every 5th point) |
 | `/<robot_ns>/cmd_vel` (e.g. `/limo1/cmd_vel`) | `geometry_msgs/Twist` | controller / test suite → LIMO (nodes publish `/cmd_vel`, remapped by the launch files) |
@@ -246,7 +274,7 @@ Builder and plotter elements:
 | Builder only | Blue drawn path (green after **Smooth Path**); buttons **Smooth Path**, **Clear**, **Publish** |
 | Plotter only | Green dashed reference path; orange live trail (cleared when a new path is published) |
 
-The obstacles come from the bridge, so whatever map the bridge uses (default or `obstacles:=...`) is what both windows show, and what the synthetic LiDAR sees. Obstacles appear once the first odometry message has arrived.
+The obstacles come from the bridge, so the map the bridge uses is what both windows show and what the CBF avoids. There are none by default. Obstacles appear once the first odometry message has arrived.
 
 ## MATLAB version
 

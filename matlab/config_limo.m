@@ -38,10 +38,10 @@ P.mpc  = struct('N', 16, 'dt', 0.04, 'q_cte', 520, 'q_dcte', 35, 'q_heading', 42
 P.nmpc = struct('N', 10, 'dt', 0.08, 'q_cte', 40, 'q_heading', 8, 'rd_steer', 2.5, ...
                 'maxiter', 8, 'lookahead', 5, 'rate_hz', 25);
 
-% ---------------------------------------------------------------- safety (LiDAR APF)
-P.safety = struct('enabled', true, 'stop', 0.28, 'caution', 0.85, ...
-                  'repulse', 0.65, 'gain', 0.35);
-P.obstacles = [1.970681 0.80659 0.35];   % [x y r] per row, lab frame (m)
+% ---------------------------------------------------------------- safety (CBF on known obstacles)
+P.cbf = struct('robot_radius', 0.20, 'safety_margin', 0.10, 'alpha', 0.6, ...
+               'max_steer', P.max_steer, 'steer_weight', 0.15);
+P.obstacles = zeros(0, 3);               % [x y r] per row, lab frame (m); default none
 
 % ---------------------------------------------------------------- simulation
 P.sim.dt           = 0.01;               % plant integration step (s)

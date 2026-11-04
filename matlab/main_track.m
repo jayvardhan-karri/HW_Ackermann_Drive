@@ -24,7 +24,7 @@ here = fileparts(mfilename('fullpath'));
 if isempty(here), here = pwd; end
 addpath(here); startup_limo();
 P = config_limo();
-% Example tweaks:  P.v_nominal = 0.3;  P.safety.enabled = false;  P.sim.steer_tau = 0;
+% Example tweaks:  P.v_nominal = 0.3;  P.obstacles = [3.5 3.9 0.2];  P.sim.steer_tau = 0;
 
 if ~exist('PATH_MODE', 'var'), PATH_MODE = 'draw'; end
 if ~exist('PRESET', 'var'), PRESET = 'figure8'; end
@@ -79,7 +79,7 @@ end
 
 %% 7. (Optional) Run on the real LIMO through ROS 2
 % Needs: ROS Toolbox, the Python phasespace_bridge running (it publishes
-% /hardware_odom and /hardware_scan), same ROS_DOMAIN_ID as P.ros.domain_id.
+% /hardware_odom and /hardware_obstacles), same ROS_DOMAIN_ID as P.ros.domain_id.
 % Lift the wheels for a first try. Uncomment:
 %
 %   result = run_on_limo(ref, 'nmpc', P);

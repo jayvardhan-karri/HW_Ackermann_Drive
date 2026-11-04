@@ -26,10 +26,10 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import LaserScan, Imu
+from sensor_msgs.msg import Imu
 
 from limo_mocap_suite.trajectory_subscriber import TrajectorySubscriber
-from limo_mocap_suite.lidar_safety import LidarSafetyFilter
+from limo_mocap_suite.obstacle_cbf import ObstacleCbfLayer
 from limo_mocap_suite.ros_compat import init_ros
 
 
@@ -53,11 +53,11 @@ class MpcTrackerNode(Node):
     #   max_steer, horizon_steps, mpc_dt, q_cte, q_dcte, q_heading, r_steer,
     #   rd_steer, lookahead_pts, log_dir, run_duration, rezero_odom, ref_offset)
     # - creates TrajectorySubscriber (listens to /reference_path) and
-    #   LidarSafetyFilter
-    # - initialises pose, scan cache and controller memory
+    #   ObstacleCbfLayer (CBF)
+    # - initialises pose and controller memory
     # - opens CSV telemetry file <log_dir>/mpc_<profile>_telemetry.csv
     # - publishers : /cmd_vel (Twist), /reference_path_viz (Path, viz copy)
-    # - subscribers: /hardware_odom (Odometry), /hardware_scan (LaserScan),
+    # - subscribers: /hardware_odom (Odometry), /hardware_obstacles (latched),
     #   /imu (Imu)
     # - timers     : control_loop @ 50 Hz (0.02 s), print_status @ 0.5 Hz
     # =========================================================================
@@ -98,7 +98,7 @@ class MpcTrackerNode(Node):
 
         self.traj = TrajectorySubscriber(self, v_nominal=v_nom,
                                          ref_offset=float(self.get_parameter('ref_offset').value))
-        self.safety = LidarSafetyFilter()
+        self.safety = ObstacleCbfLayer(self, self.wheelbase, self.max_steer, self.traj.ref_offset)
 
         self.x = 0.0
         self.y = 0.0
@@ -108,10 +108,6 @@ class MpcTrackerNode(Node):
         self.yaw0 = None
         self.v_actual = 0.0
         self.odom_received = False
-
-        self.scan_ranges = None
-        self.scan_angle_min = -2.094395
-        self.scan_angle_inc = 0.005825
 
         self.prev_steer = 0.0
         self.prev_cte = 0.0
@@ -129,14 +125,13 @@ class MpcTrackerNode(Node):
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
             't', 'x', 'y', 'yaw', 'v_actual', 'v_cmd', 'omega_cmd', 'steer_rad',
-            'x_ref', 'y_ref', 'yaw_ref', 'cte', 'heading_err', 'min_lidar_dist', 'safety_status', 'solve_ms'
+            'x_ref', 'y_ref', 'yaw_ref', 'cte', 'heading_err', 'min_clearance', 'safety_status', 'solve_ms'
         ])
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.path_pub = self.create_publisher(Path, '/reference_path_viz', 1)  # separate topic: avoids re-ingesting the decimated copy
 
         self.create_subscription(Odometry, '/hardware_odom', self.odom_cb, 20)
-        self.create_subscription(LaserScan, '/hardware_scan', self.scan_cb, 10)
         self.create_subscription(Imu, '/imu', self.imu_cb, 20)
 
         self.control_timer = self.create_timer(0.02, self.control_loop)
@@ -182,17 +177,6 @@ class MpcTrackerNode(Node):
         self.yaw = math.atan2(math.sin(raw_yaw - self.yaw0), math.cos(raw_yaw - self.yaw0))
         self.v_actual = msg.twist.twist.linear.x
         self.odom_received = True
-
-    # =========================================================================
-    # [ROS-IO] scan_cb(msg: LaserScan)
-    # -------------------------------------------------------------------------
-    # Callback for /hardware_scan. Caches ranges (as float32 numpy array),
-    # angle_min and angle_increment for the LiDAR safety filter.
-    # =========================================================================
-    def scan_cb(self, msg: LaserScan):
-        self.scan_ranges = np.array(msg.ranges, dtype=np.float32)
-        self.scan_angle_min = msg.angle_min
-        self.scan_angle_inc = msg.angle_increment
 
     # =========================================================================
     # [ROS-IO] imu_cb(msg: Imu)
@@ -298,8 +282,8 @@ class MpcTrackerNode(Node):
     #   ref point.
     # 5. d(cte)/dt, clamped integral, then _solve_ltv_mpc() (timed in ms).
     # 6. Speed: v_cmd = v_ref * max(0.4, 1 - 0.5*|steer|/max_steer).
-    # 7. LidarSafetyFilter.filter_command() scales speed / biases steering;
-    #   re-clip.
+    # 7. ObstacleCbfLayer.apply(): closest safe (v, steer) to the command (CBF on
+    #    the known obstacles); re-clip.
     # 8. Ackermann conversion: omega = v * tan(steer) / L; publish Twist on
     #   /cmd_vel.
     # 9. Append errors to history and write one CSV telemetry row.
@@ -346,8 +330,8 @@ class MpcTrackerNode(Node):
         v_mpc, steer_mpc = self._solve_ltv_mpc(cte, d_cte, heading_err, nearest_idx)
         solve_ms = (time.perf_counter() - t0) * 1000.0
 
-        v_safe, steer_safe, min_dist, status = self.safety.filter_command(
-            v_mpc, steer_mpc, self.scan_ranges, self.scan_angle_min, self.scan_angle_inc
+        v_safe, steer_safe, min_dist, status = self.safety.apply(
+            v_mpc, steer_mpc, self.x, self.y, self.yaw, self.x0, self.y0, self.yaw0
         )
         steer_safe = float(np.clip(steer_safe, -self.max_steer, self.max_steer))
         self.prev_steer = steer_safe

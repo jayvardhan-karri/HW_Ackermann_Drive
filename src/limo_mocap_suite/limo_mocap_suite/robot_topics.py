@@ -8,7 +8,7 @@
 # The nodes use absolute names (/cmd_vel, /imu). A LIMO started with a
 # namespace (`ros2 topic list` shows /limo1/cmd_vel ...) listens elsewhere, so
 # the launch files remap these two topics. Topics produced by this package
-# (/hardware_odom, /hardware_scan, /hardware_obstacles, /reference_path,
+# (/hardware_odom, /hardware_obstacles, /reference_path,
 # /reference_path_viz) are not the robot's and are never remapped.
 # Without launch:  ros2 run ... --ros-args -r /cmd_vel:=/limo1/cmd_vel
 #

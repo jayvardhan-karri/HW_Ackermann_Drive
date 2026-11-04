@@ -21,9 +21,10 @@ python3 tools/check_deps.py          # report only, installs nothing
 | `rclpy` (+ `rclpy.qos`) | `ros-foxy-rclpy` | every node; latched QoS for `/hardware_obstacles` |
 | `nav_msgs.msg` (Odometry, Path) | `ros-foxy-nav-msgs` | bridge, controllers, GUIs |
 | `geometry_msgs.msg` (Twist, PoseStamped) | `ros-foxy-geometry-msgs` | controllers, builder, test suite |
-| `sensor_msgs.msg` (LaserScan, Imu) | `ros-foxy-sensor-msgs` | bridge, controllers |
+| `sensor_msgs.msg` (Imu) | `ros-foxy-sensor-msgs` | PID, LQR, MPC (unused) |
 | `std_msgs.msg` (Float32MultiArray) | `ros-foxy-std-msgs` | bridge, builder, live plotter |
-| `phasespace_msgs.msg` (Markers, Marker) | **the lab's own package**; build it in `src/` or source its workspace | `phasespace_bridge` only |
+| `phasespace_msgs.msg` (Markers, Marker) | `mocap-ros2` branch of the lab's `phasespace-mocap-ros`; source its workspace or build the package on this machine | `phasespace_bridge` only |
+| `rcl_interfaces.msg` | comes with ROS | `obstacle_cbf.py` (parameters with no default) |
 | `launch`, `launch_ros` | `ros-foxy-launch`, `ros-foxy-launch-ros`, `ros-foxy-ros2launch` | `hw_tracking.launch.py` |
 | `ament_index_python` | `ros-foxy-ament-index-python` | `ros2 run` / launch |
 
@@ -37,7 +38,7 @@ python3 tools/check_deps.py          # report only, installs nothing
 | `scipy.interpolate.splprep/splev` | `python3-scipy` | 1.3.3 | builder **Smooth Path** |
 | `matplotlib` (+ TkAgg backend) | `python3-matplotlib` | 3.1.2 | builder, live plotter, test suite |
 | `tkinter` | `python3-tk` | 8.6 | GUI windows, builder screen size |
-| `yaml` | `python3-yaml` | 5.3.1 | launch file (`obstacles:=`, `lab_x:=`) |
+| `yaml` | `python3-yaml` | 5.3.1 | launch file and `obstacle_cbf.py` (obstacle parameters) |
 | `setuptools` | `python3-setuptools` | — | `colcon build` |
 | standard library: `math`, `os`, `csv`, `time`, `threading`, `signal`, `glob` | — | — | — |
 
@@ -67,6 +68,8 @@ The code was checked against the **Foxy branches of `rclpy`, `launch` and `launc
 | numpy / scipy / matplotlib APIs | new | 1.17 / 1.3 / 3.1 | all used functions exist (`FuncAnimation(cache_frame_data)`, `FancyArrowPatch.set_positions`, `RadioButtons(active)`, `solve_continuous_are`, SLSQP bounds, `splprep`) |
 
 ---
+
+**Added after these tests:** `obstacle_cbf.py` and the marker-based bridge were tested on Humble only. The Foxy-specific part is `declare_flexible_parameter`, whose fallback was checked by reading Foxy's API, not by running it.
 
 ## 3. How it was tested (without a Foxy machine)
 
