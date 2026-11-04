@@ -162,7 +162,7 @@ class LimoTestSuiteNode(Node):
         self.v = self.delta = self.omega = 0.0
         self.select(str(g('path')))
 
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 1)
+        self.cmd_pub = self.create_publisher(Twist, '/limo1/cmd_vel', 1) # updated from /cmd_vel to /limo1/cmd_vel as Limo takes Velocity commands via this topic.
         self.create_subscription(Path, '/reference_path', self.path_cb, 10)
         self.timer = self.create_timer(0.02, self.tick)
         self.get_logger().info(
