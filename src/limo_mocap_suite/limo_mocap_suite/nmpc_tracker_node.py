@@ -48,7 +48,7 @@ class NmpcTrackerNode(Node):
     # Builds the NMPC node:
     # - declares/reads ROS parameters (profile, v_nominal, wheelbase,
     #   max_steer, horizon_steps, mpc_dt, q_cte, q_heading, r_steer, rd_steer,
-    #   log_dir, run_duration, rezero_odom)
+    #   log_dir, run_duration, rezero_odom, ref_offset)
     # - creates TrajectorySubscriber (listens to /reference_path) and
     #   LidarSafetyFilter
     # - initialises pose, scan cache and controller memory
@@ -63,6 +63,7 @@ class NmpcTrackerNode(Node):
         self.declare_parameter('profile', 'figure8')
         self.declare_parameter('v_nominal', 0.40)
         self.declare_parameter('wheelbase', 0.20)
+        self.declare_parameter('ref_offset', 0.10)  # marker midpoint ahead of the rear axle (m)
         self.declare_parameter('max_steer', 0.48869)
         self.declare_parameter('horizon_steps', 10)
         self.declare_parameter('mpc_dt', 0.08)
@@ -87,7 +88,8 @@ class NmpcTrackerNode(Node):
         self.run_duration = float(self.get_parameter('run_duration').value)
         self.rezero_odom = bool(self.get_parameter('rezero_odom').value)
 
-        self.traj = TrajectorySubscriber(self, v_nominal=v_nom)
+        self.traj = TrajectorySubscriber(self, v_nominal=v_nom,
+                                         ref_offset=float(self.get_parameter('ref_offset').value))
         self.safety = LidarSafetyFilter()
 
         self.x = 0.0
@@ -183,14 +185,18 @@ class NmpcTrackerNode(Node):
     # [CORE]   _cost_function(u_steer, x0, y0, yaw0, ref_horizon) -> float
     # -------------------------------------------------------------------------
     # Objective evaluated by SLSQP. Forward-simulates the nonlinear bicycle
-    # model (Euler, dt = mpc_dt) under the candidate steering sequence and sums
+    # model of the rear axle (Euler, dt = mpc_dt), measures errors at the tracked
+    # point ref_offset ahead of it, under the candidate steering sequence, and sums
     # q_cte*cte^2 + q_heading*heading_err^2 + rd_steer*(u_k - u_{k-1})^2.
     # =========================================================================
     def _cost_function(self, u_steer, x0, y0, yaw0, ref_horizon):
         cost = 0.0
-        x, y, yaw = x0, y0, yaw0
         L = self.wheelbase
         dt = self.mpc_dt
+        # The bicycle model holds for the rear axle; errors are taken at the tracked point ahead of it
+        lo = self.traj.ref_offset
+        yaw = yaw0
+        x, y = x0 - lo * math.cos(yaw0), y0 - lo * math.sin(yaw0)
         
         for k in range(self.N):
             vk = ref_horizon[k, 3]
@@ -201,9 +207,10 @@ class NmpcTrackerNode(Node):
             yaw += (vk / L) * math.tan(dk) * dt
             
             xr, yr, th_r, vr, kr = ref_horizon[k]
-            dx, dy = xr - x, yr - y
+            dx, dy = xr - (x + lo * math.cos(yaw)), yr - (y + lo * math.sin(yaw))
             cte = -math.sin(th_r) * dx + math.cos(th_r) * dy
-            herr = math.atan2(math.sin(th_r - yaw), math.cos(th_r - yaw))
+            th_des = th_r - math.atan(lo * kr)
+            herr = math.atan2(math.sin(th_des - yaw), math.cos(th_des - yaw))
             
             d_prev = self.prev_steer if k == 0 else u_steer[k-1]
             slew = dk - d_prev
@@ -230,8 +237,9 @@ class NmpcTrackerNode(Node):
             pt_k = self.traj.waypoints[idx_int]
             nxt_pt = self.traj.waypoints[self.traj.index(idx_int + 1)]
             ds = max(math.hypot(nxt_pt[0] - pt_k[0], nxt_pt[1] - pt_k[1]), 1e-3)
-            ref_horizon[k] = pt_k
             curr_idx += (pt_k[3] * dt) / ds
+            # Cost term k scores the state AFTER step k, so compare it with the point one step on
+            ref_horizon[k] = self.traj.waypoints[self.traj.index(round(curr_idx))]
             
         bounds = [(-self.max_steer, self.max_steer) for _ in range(self.N)]
         

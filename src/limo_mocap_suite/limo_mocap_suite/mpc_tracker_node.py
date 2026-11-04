@@ -51,7 +51,7 @@ class MpcTrackerNode(Node):
     # Builds the MPC node:
     # - declares/reads ROS parameters (profile, v_nominal, wheelbase,
     #   max_steer, horizon_steps, mpc_dt, q_cte, q_dcte, q_heading, r_steer,
-    #   rd_steer, lookahead_pts, log_dir, run_duration, rezero_odom)
+    #   rd_steer, lookahead_pts, log_dir, run_duration, rezero_odom, ref_offset)
     # - creates TrajectorySubscriber (listens to /reference_path) and
     #   LidarSafetyFilter
     # - initialises pose, scan cache and controller memory
@@ -67,6 +67,7 @@ class MpcTrackerNode(Node):
         self.declare_parameter('profile', 'figure8')
         self.declare_parameter('v_nominal', 0.40)
         self.declare_parameter('wheelbase', 0.20)
+        self.declare_parameter('ref_offset', 0.10)  # marker midpoint ahead of the rear axle (m)
         self.declare_parameter('max_steer', 0.48869)
         self.declare_parameter('horizon_steps', 16)
         self.declare_parameter('mpc_dt', 0.04)
@@ -95,7 +96,8 @@ class MpcTrackerNode(Node):
         self.run_duration = float(self.get_parameter('run_duration').value)
         self.rezero_odom = bool(self.get_parameter('rezero_odom').value)
 
-        self.traj = TrajectorySubscriber(self, v_nominal=v_nom)
+        self.traj = TrajectorySubscriber(self, v_nominal=v_nom,
+                                         ref_offset=float(self.get_parameter('ref_offset').value))
         self.safety = LidarSafetyFilter()
 
         self.x = 0.0

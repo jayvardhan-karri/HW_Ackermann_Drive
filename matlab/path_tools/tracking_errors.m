@@ -11,7 +11,10 @@ function [err, last_idx] = tracking_errors(ref, pose, lookahead, last_idx, P)
 %   2. Look-ahead waypoint j = ref_index(nearest + lookahead).
 %   3. cte  = lateral offset of the nearest point in the path frame
 %             (positive = path lies to the robot's LEFT -> steer left).
-%      herr = wrap(yaw_lookahead - yaw_robot).
+%      herr = wrap(yaw_nearest - atan(ref_offset*kappa_nearest) - yaw_robot):
+%      zero when tracking perfectly. A look-ahead yaw would be non-zero on any
+%      curve and force a steady inside offset; the atan term is the angle between
+%      the tracked point's travel direction and the robot's yaw.
 %   4. Open path: goal = nearest is the last point and the robot is within
 %      goal_tol of (or past) it along the final tangent.
 %
@@ -29,7 +32,7 @@ j = ref_index(ref, nearest + lookahead);
 
 yr = ref.yaw(nearest);
 err.cte  = -sin(yr) * (ref.x(nearest) - pose(1)) + cos(yr) * (ref.y(nearest) - pose(2));
-err.herr = wrap_angle(ref.yaw(j) - pose(3));
+err.herr = wrap_angle(yr - atan(P.ref_offset * ref.kappa(nearest)) - pose(3));
 err.la = ref.W(j, :);
 err.nearest = nearest;
 err.goal = false;

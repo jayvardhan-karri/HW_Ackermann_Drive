@@ -15,6 +15,8 @@
 #         obstacles          "[x, y, r, ...]" for the bridge; '' = bridge default
 #         lab_x, lab_y       "[min, max]" lab extents for both GUIs; '' = default
 #                            ([-0.5, 8.0] and [-1.0, 6.0])
+#         ref_offset         marker midpoint ahead of the rear axle in m (0.10);
+#                            measure it on the robot, forwarded to the controller
 #         robot_ns           namespace of the LIMO's own topics (default limo1):
 #                            /cmd_vel -> /<robot_ns>/cmd_vel, /imu -> /<robot_ns>/imu
 #                            for the controller; none = no namespace (plain /cmd_vel)
@@ -53,12 +55,13 @@ def _controller_node(context):
         raise RuntimeError(f"controller must be one of {CONTROLLERS}, got '{name}'")
     rezero = LaunchConfiguration('rezero_odom').perform(context).lower() == 'true'
     duration = float(LaunchConfiguration('run_duration').perform(context))
+    offset = float(LaunchConfiguration('ref_offset').perform(context))
     return [Node(
         package='limo_mocap_suite',
         executable=f'{name}_tracker',
         output='screen',
         emulate_tty=True,
-        parameters=[{'rezero_odom': rezero, 'run_duration': duration}],
+        parameters=[{'rezero_odom': rezero, 'run_duration': duration, 'ref_offset': offset}],
         remappings=robot_remappings(LaunchConfiguration('robot_ns').perform(context)),
     )]
 
@@ -134,6 +137,8 @@ def generate_launch_description():
                               description='GUI lab X extent "[min, max]" (empty = default)'),
         DeclareLaunchArgument('lab_y', default_value='',
                               description='GUI lab Y extent "[min, max]" (empty = default)'),
+        DeclareLaunchArgument('ref_offset', default_value='0.10',
+                              description='Marker midpoint ahead of the rear axle (m)'),
         DeclareLaunchArgument('robot_ns', default_value=DEFAULT_ROBOT_NS,
                               description="LIMO topic namespace: /cmd_vel -> /<robot_ns>/cmd_vel (none = no namespace)"),
 

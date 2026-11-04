@@ -150,7 +150,7 @@ The tightest curve the LIMO can follow is `κ_max = tan(28°) / 0.2 = 2.66 1/m` 
 **Tracking errors (`tracking_errors.m`).** This is the port of `compute_tracking_errors`:
 1. Nearest waypoint inside a sliding window `[last − 25, last + 160]`. This is fast, and it cannot jump to the other lobe where a figure-8 crosses itself. If the nearest point is more than 1.5 m away, it falls back to a global search.
 2. The look-ahead point is `nearest + lookahead` samples ahead. `ref_index` wraps the index on a closed loop and clamps it on an open path.
-3. `cte = −sin(yaw_r)(x_r − x) + cos(yaw_r)(y_r − y)`, which is positive when the path lies to the robot's left. `herr = wrap(yaw_lookahead − yaw)`.
+3. `cte = −sin(yaw_r)(x_r − x) + cos(yaw_r)(y_r − y)`, which is positive when the path lies to the robot's left. `herr = wrap(yaw_r − atan(ref_offset·κ_r) − yaw)`, which is zero when tracking perfectly. A look-ahead yaw would be non-zero on any curve and force a steady inside offset. The atan term is the angle between the tracked point's travel direction and the robot's yaw.
 4. Open path: `goal` is set when the nearest point is the last one and the robot is within 5 cm of it, or past it.
 
 ### 4.3 Robot model and shared laws
@@ -185,7 +185,7 @@ This is a port of the Python LTV-MPC with identical matrices and weights.
 4. `delta = Σ w_k atan(Lκ_k) − K₁ z + 0.06 ∫cte`, where the preview weights are `w = [0.45 0.25 0.15 0.10 0.05]`. The result is clipped.
 
 **NMPC (`ctrl_nmpc.m`)**
-Decision variables are the N = 10 steering angles, 0.08 s apart (0.8 s of preview). For a candidate `u`, the robot is forward-simulated with the **nonlinear** model and compared with reference sample k:
+Decision variables are the N = 10 steering angles, 0.08 s apart (0.8 s of preview). The roll-out is of the rear axle, and errors are measured at the tracked point `ref_offset` ahead of it, against the reference point at that same predicted time. For a candidate `u`, the robot is forward-simulated with the **nonlinear** model and compared with reference sample k:
 ```
 J(u) = Σ_k  q_cte·cte_k² + q_heading·herr_k² + rd·(u_k − u_{k−1})²,    |u_k| ≤ delta_max
 ```
@@ -209,7 +209,7 @@ The simulation uses the synthetic scan; `run_on_limo` uses the real `/hardware_s
 
 ### 4.6 Simulation (`run_simulation.m`)
 
-* The plant is integrated every `P.sim.dt` = 10 ms. The controller runs at its own rate with a zero-order hold in between, like the ROS timers.
+* The plant is the rear axle, and the logged pose is the tracked point `P.ref_offset` ahead of it, as on the robot. It is integrated every `P.sim.dt` = 10 ms. The controller runs at its own rate with a zero-order hold in between, like the ROS timers.
 * **Steering servo lag:** a first-order lag `P.sim.steer_tau` = 0.05 s between the commanded and actual steering. Set it to 0 for an ideal actuator. With the lag, the high-gain controllers (LQR, LTV-MPC) show visible steering chatter. This is a real effect: it is why LQR has the highest steering rate in the Gazebo results too.
 * **Start:** the path start plus `P.sim.start_offset` (0.10 m to the side and 10° of heading by default), to show convergence.
 * **End:** an open path ends at its goal; a closed loop ends after `P.sim.laps` laps (time estimate); never longer than `P.sim.t_max`.
@@ -234,6 +234,7 @@ Do **not** run a Python controller at the same time: both would publish `/cmd_ve
 | Field | Default | Meaning |
 |---|---|---|
 | `L`, `max_steer`, `v_nominal` | 0.20 m, 0.48869 rad, 0.40 m/s | Robot |
+| `ref_offset` | 0.10 m | Tracked point (marker midpoint) ahead of the rear axle; measure it |
 | `lab_x`, `lab_y` | [−0.5 8], [−1 6] | Lab grid extents (m) |
 | `ref.ds` | 0.01 | Waypoint spacing (m) |
 | `ref.speed_gain` | 0.75 | Speed reduction in curves |
@@ -265,7 +266,7 @@ Run in MATLAB R2026a in batch mode:
 
 | Test | Result |
 |---|---|
-| Figure-8 preset, all four controllers (simulation) | RMS CTE: PID 0.057, LQR 0.031, LTV-MPC 0.045, NMPC 0.032 m. Steering-rate RMS: NMPC 0.21 rad/s (smoothest), LQR 2.57 rad/s. Same ranking as the Gazebo experiments. |
+| Figure-8 preset, all four controllers (simulation, plant with 0.10 m offset) | RMS CTE after the 15 s start-up: PID 0.0105, LQR 0.0023, LTV-MPC 0.0025, NMPC 0.0052 m. Whole run: 0.019, 0.013, 0.013, 0.017 m. Steering-rate RMS: NMPC 0.20 rad/s (smoothest), LQR 2.53 rad/s. |
 | Jittery scripted free-hand S-curve (4 cm mouse noise) through `draw_path` → smoothing → all controllers | Max curvature after smoothing 3.4 1/m. All four reach the goal (end within 1 cm of the path end). RMS CTE 0.024–0.044 m. |
 | Obstacle placed on a straight path | Safety stopped the robot 0.28 m from the obstacle (`EMERGENCY_STOP`) |
 | LQR gain vs the Theory worked example | `[-7.071 -3.582]` |

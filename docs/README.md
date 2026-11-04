@@ -75,6 +75,11 @@ ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:
     obstacles:="[1.970681, 0.80659, 0.35]"
 ```
 
+> [!IMPORTANT]
+> **Measure `ref_offset` before tracking runs.** Measure along the robot's centre line from the rear axle to the midpoint of markers 0 and 1, and pass it with `ref_offset:=<metres>`. In a fake-robot test, a 5 cm error left 1.6–5.1 cm RMS, depending on the controller.
+>
+> **Start the controller before clicking Publish.** The path is sent once; a controller started later never receives it and waits, leaving a CSV with only a header. Clicking **Publish** again fixes it.
+
 ### Step by step (separate terminals)
 
 **1. PhaseSpace bridge**
@@ -152,6 +157,7 @@ The commands depend only on the path, `speed`, `wheelbase` and `max_steer`; plac
 | `run_duration` | `0.0` | seconds | Controller time limit; `0` = until the path end or Ctrl-C |
 | `obstacles` | `''` | `"[x, y, r, ...]"` | Bridge obstacle map; empty = the bridge default (simulation arena) |
 | `lab_x`, `lab_y` | `''` | `"[min, max]"` | Lab extents for both GUIs; empty = `[-0.5, 8.0]` and `[-1.0, 6.0]` |
+| `ref_offset` | `0.10` | metres | Marker midpoint ahead of the rear axle; forwarded to the controller |
 | `robot_ns` | `limo1` | name, or `none` | Namespace of the LIMO's topics: the controller's `/cmd_vel` → `/<robot_ns>/cmd_vel`, `/imu` → `/<robot_ns>/imu`; `none` = no namespace |
 
 ### Node parameters (`--ros-args -p name:=value`)
@@ -173,6 +179,7 @@ Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) 
 |---|---|---|
 | `v_nominal` | `0.40` | Cruise speed (m/s); reduced automatically in curves |
 | `wheelbase` | `0.20` | LIMO wheelbase L (m) |
+| `ref_offset` | `0.10` | Distance of the marker midpoint **ahead of the rear axle** (m). Measure it on your robot: 0.10 assumes the midpoint is halfway between the axles |
 | `max_steer` | `0.48869` | Steering limit (rad, 28°) |
 | `rezero_odom` | `true` | Path relative to the start pose (`true`) or absolute PhaseSpace frame (`false`) |
 | `run_duration` | `45.0` (PID), `25.0` (others) | Time limit in s; `0` = no limit. An open path also ends the run. |

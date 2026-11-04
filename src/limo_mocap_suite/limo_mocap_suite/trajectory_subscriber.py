@@ -34,8 +34,10 @@ class TrajectorySubscriber:
     # table (path_ready = False, is_closed = False, goal_reached = False) and
     # subscribes to /reference_path on that node.
     # =========================================================================
-    def __init__(self, node, v_nominal=0.40):
+    def __init__(self, node, v_nominal=0.40, ref_offset=0.10):
         self.node = node
+        # Distance of the tracked point (marker midpoint) ahead of the rear axle (m)
+        self.ref_offset = ref_offset
         self.v_nominal = v_nominal
         self.waypoints = np.zeros((0, 5))
         self.path_ready = False
@@ -124,7 +126,10 @@ class TrajectorySubscriber:
     # 2. Lookahead point = index(nearest_idx + lookahead_pts).
     # 3. cte = lateral offset of the NEAREST point in the path frame
     #    (positive = path lies to the robot's left).
-    # 4. heading_err = wrap(yaw_lookahead - yaw_robot).
+    # 4. heading_err = wrap(yaw_nearest - atan(ref_offset*kappa_nearest) - yaw).
+    #    Zero when tracking perfectly: a look-ahead yaw would be non-zero on any
+    #    curve and force a steady inside offset. The atan term is the angle
+    #    between the tracked point's travel direction and the robot's yaw.
     # 5. Open path only: once the nearest point is the last one and the robot
     #    is within 5 cm of (or past) it, set goal_reached = True.
     # Empty table -> zeros and the robot's own pose.
@@ -155,7 +160,7 @@ class TrajectorySubscriber:
         dx_err = x_r - x
         dy_err = y_r - y
         cte = -math.sin(yaw_r) * dx_err + math.cos(yaw_r) * dy_err
-        heading_err = self.normalize_angle(yaw_lh - yaw)
+        heading_err = self.normalize_angle(yaw_r - math.atan(self.ref_offset * kappa_r) - yaw)
 
         if not self.is_closed and nearest_idx == n - 1:
             # Signed distance along the final tangent: >= 0 means at / past the end

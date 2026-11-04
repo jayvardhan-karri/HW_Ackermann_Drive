@@ -66,7 +66,10 @@ while t <= t_end
     else
         delta_act = delta_cmd;
     end
-    pose = bicycle_step(pose, v_cmd, delta_act, P.L, P.sim.dt);
+    % The bicycle model holds for the rear axle; pose is the tracked point ahead of it
+    rear = [pose(1) - P.ref_offset*cos(pose(3)), pose(2) - P.ref_offset*sin(pose(3)), pose(3)];
+    rear = bicycle_step(rear, v_cmd, delta_act, P.L, P.sim.dt);
+    pose = [rear(1) + P.ref_offset*cos(rear(3)), rear(2) + P.ref_offset*sin(rear(3)), rear(3)];
     step = step + 1; t = step * P.sim.dt;
 end
 for f = fieldnames(log)'

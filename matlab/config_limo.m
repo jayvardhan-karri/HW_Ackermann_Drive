@@ -9,6 +9,7 @@ function P = config_limo()
 
 % ---------------------------------------------------------------- robot
 P.L          = 0.20;        % wheelbase (m)
+P.ref_offset = 0.10;        % tracked point (marker midpoint) ahead of the rear axle (m); measure it
 P.max_steer  = 0.48869;     % steering limit (rad) = 28 deg (limo_driver.h)
 P.v_nominal  = 0.40;        % cruise speed (m/s), reduced in curves
 

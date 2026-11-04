@@ -49,7 +49,7 @@ class PidTrackerNode(Node):
     # Builds the PID node:
     # - declares/reads ROS parameters (profile, v_nominal, kp_cte, ki_cte,
     #   kd_cte, kp_heading, wheelbase, max_steer, lookahead_pts, log_dir,
-    #   run_duration, rezero_odom)
+    #   run_duration, rezero_odom, ref_offset)
     # - creates TrajectorySubscriber (listens to /reference_path) and
     #   LidarSafetyFilter
     # - initialises pose, scan cache and controller memory
@@ -70,6 +70,7 @@ class PidTrackerNode(Node):
         self.declare_parameter('kd_cte', 0.45)
         self.declare_parameter('kp_heading', 1.15)
         self.declare_parameter('wheelbase', 0.20)
+        self.declare_parameter('ref_offset', 0.10)  # marker midpoint ahead of the rear axle (m)
         self.declare_parameter('max_steer', 0.48869)  # 28 deg from limo_driver.h
         self.declare_parameter('lookahead_pts', 10)
         self.declare_parameter('log_dir', 'evaluation')
@@ -88,7 +89,8 @@ class PidTrackerNode(Node):
         self.run_duration = float(self.get_parameter('run_duration').value)
         self.rezero_odom = bool(self.get_parameter('rezero_odom').value)
 
-        self.traj = TrajectorySubscriber(self, v_nominal=v_nom)
+        self.traj = TrajectorySubscriber(self, v_nominal=v_nom,
+                                         ref_offset=float(self.get_parameter('ref_offset').value))
         self.safety = LidarSafetyFilter()
 
         # State variables
