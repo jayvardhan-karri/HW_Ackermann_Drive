@@ -16,6 +16,10 @@
 #         robot_radius, safety_margin, cbf_alpha  CBF clearance (0.20, 0.10, 0.6)
 #         cbf_max_steer      steering the CBF plans with; 0 = max_steer (0.0)
 #         lab_x, lab_y       "[min, max]" lab extents for both GUIs; '' = default
+#         view               'behind' (+X up, +Y left) or 'topdown' for both GUIs
+#         track_radius       0 = draw a path (default); > 0 = capsule track, no drawing
+#         track_straight, track_x, track_y, start_delay   capsule size, centre, warning
+#         guard              true: stop / rejoin on drift (extension; default false)
 #                            ([-0.5, 8.0] and [-1.0, 6.0])
 #         ref_offset         marker midpoint ahead of the rear axle in m (0.10);
 #                            measure it on the robot, forwarded to the controller
@@ -59,7 +63,18 @@ def _controller_node(context):
     rezero = LaunchConfiguration('rezero_odom').perform(context).lower() == 'true'
     duration = float(LaunchConfiguration('run_duration').perform(context))
     offset = float(LaunchConfiguration('ref_offset').perform(context))
-    params = {'rezero_odom': rezero, 'run_duration': duration, 'ref_offset': offset}
+    params = {'rezero_odom': rezero, 'run_duration': duration, 'ref_offset': offset,
+              'laps': int(LaunchConfiguration('laps').perform(context)),
+              'guard': LaunchConfiguration('guard').perform(context).lower() == 'true',
+              'approach': LaunchConfiguration('approach').perform(context).lower() == 'true',
+              'log_dir': LaunchConfiguration('log_dir').perform(context),
+              'path_name': LaunchConfiguration('path_name').perform(context)}
+    for arg in ('approach_radius', 'approach_speed', 'slow_cte', 'rejoin_cte', 'abort_cte'):
+        params[arg] = float(LaunchConfiguration(arg).perform(context))
+    for arg, key in (('lab_x', 'guard_lab_x'), ('lab_y', 'guard_lab_y')):
+        text = LaunchConfiguration(arg).perform(context).strip()
+        if text:
+            params[key] = [float(v) for v in yaml.safe_load(text)]
     for arg in ('robot_radius', 'safety_margin', 'cbf_alpha', 'cbf_max_steer'):
         params[arg] = float(LaunchConfiguration(arg).perform(context))
     return [Node(
@@ -96,22 +111,46 @@ def _bridge_node(context):
 
 
 # =============================================================================
+# [LIFE]   _track_node(context)
+# -----------------------------------------------------------------------------
+# With track_radius > 0, track_publisher sends the capsule instead of a drawn path.
+# =============================================================================
+def _track_node(context):
+    radius = float(LaunchConfiguration('track_radius').perform(context))
+    if radius <= 0.0:
+        return []
+    params = {'track_radius': radius}
+    for arg in ('track_straight', 'track_x', 'track_y', 'start_delay'):
+        params[arg] = float(LaunchConfiguration(arg).perform(context))
+    for arg in ('lab_x', 'lab_y'):
+        text = LaunchConfiguration(arg).perform(context).strip()
+        if text:
+            params[arg] = [float(v) for v in yaml.safe_load(text)]
+    return [Node(package='limo_mocap_suite', executable='track_publisher', output='screen',
+                 emulate_tty=True, parameters=[params])]
+
+
+# =============================================================================
 # [LIFE]   _gui_nodes(context)
 # -----------------------------------------------------------------------------
 # Returns interactive_builder and live_plotter (each only if its argument is
 # true) with rezero_odom and, when non-empty, lab_x / lab_y (YAML lists).
 # =============================================================================
 def _gui_nodes(context):
-    params = {'rezero_odom': LaunchConfiguration('rezero_odom').perform(context).lower() == 'true'}
+    params = {'rezero_odom': LaunchConfiguration('rezero_odom').perform(context).lower() == 'true',
+              'view': LaunchConfiguration('view').perform(context)}
     for name in ('lab_x', 'lab_y'):
         text = LaunchConfiguration(name).perform(context).strip()
         if text:
             params[name] = [float(v) for v in yaml.safe_load(text)]
+    remap = robot_remappings(LaunchConfiguration('robot_ns').perform(context))   # KILL sends zero commands
     nodes = []
     for arg, exe in (('builder', 'interactive_builder'), ('plotter', 'live_plotter')):
-        if LaunchConfiguration(arg).perform(context).lower() == 'true':
+        drawing = float(LaunchConfiguration('track_radius').perform(context)) <= 0.0
+        if LaunchConfiguration(arg).perform(context).lower() == 'true' and (drawing or exe != 'interactive_builder'):
             nodes.append(Node(package='limo_mocap_suite', executable=exe,
-                              output='screen', parameters=[params]))
+                              output='screen', parameters=[params],
+                              remappings=remap if exe == 'live_plotter' else []))
     return nodes
 
 
@@ -132,8 +171,29 @@ def generate_launch_description():
                               description='Start the interactive path builder GUI'),
         DeclareLaunchArgument('plotter', default_value='true',
                               description='Start the live plotter GUI'),
-        DeclareLaunchArgument('rezero_odom', default_value='true',
-                              description='Interpret the path relative to the start pose'),
+        DeclareLaunchArgument('rezero_odom', default_value='false',
+                              description='false: absolute MoCap frame (default); true: path relative to the start pose'),
+        DeclareLaunchArgument('laps', default_value='1',
+                              description='Laps on a closed path; 0 = until stopped. Open paths run once'),
+        DeclareLaunchArgument('log_dir', default_value='evaluation',
+                              description='Each run gets its own folder here'),
+        DeclareLaunchArgument('track_radius', default_value='0.0',
+                              description='0 = draw a path; > 0 = capsule track with this curve radius (m)'),
+        DeclareLaunchArgument('track_straight', default_value='3.0', description='Capsule straight length (m)'),
+        DeclareLaunchArgument('track_x', default_value='3.75', description='Capsule centre X (m)'),
+        DeclareLaunchArgument('track_y', default_value='2.5', description='Capsule centre Y (m)'),
+        DeclareLaunchArgument('start_delay', default_value='5.0', description='Capsule: seconds of warning before moving'),
+        DeclareLaunchArgument('guard', default_value='false',
+                              description='true: slow, rejoin and stop on drift (extension)'),
+        DeclareLaunchArgument('approach', default_value='true',
+                              description='true: drive to the path start first; false: track directly'),
+        DeclareLaunchArgument('path_name', default_value='drawn', description='Label in the run folder name'),
+        DeclareLaunchArgument('approach_radius', default_value='0.60',
+                              description='Turning radius used to reach the path (m)'),
+        DeclareLaunchArgument('approach_speed', default_value='0.25', description='Speed on the way to the path (m/s)'),
+        DeclareLaunchArgument('slow_cte', default_value='0.15', description='Guard: slow down above this error (m)'),
+        DeclareLaunchArgument('rejoin_cte', default_value='0.35', description='Guard: plan a way back above this error (m)'),
+        DeclareLaunchArgument('abort_cte', default_value='1.00', description='Guard: stop above this error (m)'),
         DeclareLaunchArgument('run_duration', default_value='0.0',
                               description='Run time limit in seconds (0 = none)'),
         DeclareLaunchArgument('obstacles', default_value='',
@@ -148,6 +208,8 @@ def generate_launch_description():
                               description='Steering limit for the CBF (rad); 0 = max_steer'),
         DeclareLaunchArgument('cbf_alpha', default_value='0.6',
                               description='CBF gain (1/s)'),
+        DeclareLaunchArgument('view', default_value='behind',
+                              description="GUI orientation: 'behind' or 'topdown'"),
         DeclareLaunchArgument('lab_x', default_value='',
                               description='GUI lab X extent "[min, max]" (empty = default)'),
         DeclareLaunchArgument('lab_y', default_value='',
@@ -160,4 +222,5 @@ def generate_launch_description():
         OpaqueFunction(function=_bridge_node),
         OpaqueFunction(function=_controller_node),
         OpaqueFunction(function=_gui_nodes),
+        OpaqueFunction(function=_track_node),
     ])

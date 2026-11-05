@@ -18,6 +18,12 @@ The package is modular, separating trajectory generation, state estimation, safe
 *   **`plot_helpers.py`**: Shared drawing code for the GUIs: lab grid with red axes for the projector, robot glyph, obstacles, controller frame, Ctrl-C handling.
 *   **`trajectory_subscriber.py`**: A mathematical utility class used by all controllers. It subscribes to `/reference_path` and calculates local derivatives (curvature $\kappa$ and reference velocity $v_{\text{ref}}$). It also detects whether the path is a closed loop or an open path.
 *   **`obstacle_cbf.py`**: The Control Barrier Function (CBF) safety filter, used by all four controllers. Using the known obstacle positions (no LiDAR), it adjusts speed and steering by the smallest amount that keeps the robot clear, going around obstacles on the path.
+*   **`run_manager.py`**: Everything a controller does besides steering, shared by all four: reach the path start, count laps, watch the errors, obey KILL, log each run, wait for the next path.
+*   **`approach_planner.py`**: Dubins paths: the shortest way an Ackermann robot can get onto a path.
+*   **`lap_stats.py`**: Per-lap numbers: error, time at the steering limit, steering rate.
+*   **`mpc_obstacles.py`**: Obstacles as constraints inside LTV-MPC and NMPC (`obstacle_mode:=constraint`), instead of the CBF filter.
+*   **`track_tools.py`**, **`track_publisher.py`**: The capsule track, and the node that sends it instead of a drawn path.
+*   **`lap_test.py`**, **`lap_report.py`**: The lap test sequence and its report. **`sim_limo.py`**: stand-in robot for rehearsing without the lab.
 *   **Controllers** (subscribe to `/hardware_odom` and `/hardware_obstacles`):
     *   **`pid_tracker_node.py`**: Kinematic Ackermann PID with Curvature Feedforward.
     *   **`lqr_tracker_node.py`**: Infinite-Horizon Continuous Algebraic Riccati Equation (ARE) tracker.
@@ -44,8 +50,8 @@ Do **not** install Python 3.10 for Foxy: Foxy's `rclpy` only works with Python 3
 
 There are **no obstacles by default**. Give them on launch as a flat list, by rim markers, or both:
 ```bash
-ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:=false obstacles:="[1.97, 0.81, 0.35]"
-ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:=false obstacle_markers:="[(2,3,4,5),(6,7,8,9)]"
+ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc obstacles:="[1.97, 0.81, 0.35]"
+ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc obstacle_markers:="[(2,3,4,5),(6,7,8,9)]"
 ```
 *   **Rim markers:** 4 markers evenly spaced around the top edge of each cylinder. Centre = mean of the 4, radius = mean distance from the centre, updated live if the obstacle moves. If a marker is occluded, the last known circle is kept. A group must be fully tracked once before it exists, and the bridge warns until then, so **check that the obstacle appears on the live plotter before driving**.
 *   **Behaviour:** the robot keeps its tracked point `robot_radius + safety_margin` (0.30 m) from each cylinder's edge, goes around an obstacle on its path, and rejoins. It stops (`CBF_STOP`) only if there is no safe way forward. Telemetry logs `min_clearance` and `safety_status`.
@@ -85,23 +91,89 @@ Because the control stack runs off-board, the base station and the LIMO must sha
 >
 > Check: `ros2 node info /nmpc_tracker_node` must list `/limo1/cmd_vel` under *Publishers*.
 
+### What happens when you press Publish
+
+1. **Getting there.** If the robot is more than 0.15 m from the path start, or more than 30° off its heading, it drives there first along a Dubins path: arcs of `approach_radius` (0.60 m) joined by a straight, at `approach_speed`. An Ackermann robot cannot turn on the spot, so it may have to loop around: starting just past the point needs a loop of about 4 m. The way there avoids known obstacles and stays inside the lab.
+2. **Driving.** An open path runs once. A closed path runs `laps` times (default 1, `laps:=0` until stopped). Laps are counted by forward progress along the path.
+3. **Afterwards.** The robot stops and the controller **stays running**: draw and publish another path and it goes again. Only Ctrl-C ends it. A new path during a run replaces the old one.
+
+### Logs: the `evaluation/` folder
+
+Every run gets its own folder in `evaluation/`, relative to where you launched: `evaluation/<date>_<time>_<controller>_<path_name>/`, with `telemetry.csv` and `summary.json` (result, reason, stats per lap). Nothing is overwritten. Make a report from any folder holding runs:
+```bash
+ros2 run limo_mocap_suite lap_report evaluation
+```
+
+### Capsule track: one controller
+
+Instead of drawing, give `hw_tracking.launch.py` a curve radius. It sends a capsule track (two straights, two half circles) once the controller is ready, and the drawing window stays closed. Without `track_radius`, drawing works as always.
+```bash
+ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=lqr track_radius:=1.0 laps:=3
+```
+
+### Lap test: all controllers on three radii, with a report
+
+```bash
+ros2 launch limo_mocap_suite lap_test.launch.py
+```
+
+For each radius, each controller (`pid,lqr,mpc,nmpc`) in turn drives to the start and does 3 laps. It warns 5 s before moving. At 0.30 m/s the whole test takes roughly 40 minutes. Shorten it with the arguments below.
+
+| Radius | Why |
+|---|---|
+| 1.0 m | Well inside the steering limit: every controller should work, so they can be compared |
+| 0.5 m | At the limit |
+| 0.4 m | Beyond the limit (about 0.46 m): the robot must drift, which shows which controller recovers best |
+
+Results go to `evaluation/lap_test_<date>_<time>/`: `report.md` and `comparison.png` compare the radii, and `R1/`, `R0.5/`, `R0.4/` each have their own report. A run that cannot get round a tight track within its time limit is recorded, and the test goes on.
+
+```bash
+ros2 launch limo_mocap_suite lap_test.launch.py track_radii:=1.0 controllers:=lqr,nmpc laps:=2
+```
+Rehearse with no robot and no lab:
+```bash
+ros2 launch limo_mocap_suite lap_test.launch.py sim:=true robot_ns:=none
+```
+
+### Safety while driving
+
+**Always on:**
+
+| Trigger | What happens |
+|---|---|
+| **KILL** button in the live view | Every controller stops and refuses to move until **RE-ARM** and a new path. A lap test ends there. The button depends on the window and ROS running: **it is not a hardware stop**. Keep the LIMO's own stop within reach |
+| No odometry for 0.5 s | Zero command until odometry returns. Leaving the MoCap area ends up here |
+| A controller stops reporting (lap test) | Zero command; the test stops |
+
+**Extensions, off by default:**
+
+`guard:=true` adds stops that can interrupt a run. It is off so the controller alone decides what happens when the robot drifts, which is what the 0.4 m track measures.
+
+| Trigger, with `guard:=true` | What happens |
+|---|---|
+| Error above `slow_cte` (0.15 m) | Slows down, to 40 % at `rejoin_cte` |
+| Error above `rejoin_cte` (0.35 m), or heading more than 75° off | Plans a drivable way back onto the path, ahead of where it left. Waits while the CBF is going around an obstacle |
+| Error above `abort_cte` (1.0 m), more than 3 rejoins, left `lab_x`/`lab_y`, no way back, approach too slow, or no odometry for 3 s | Stops. In a lap test, the remaining controllers do not run |
+
+Lap-to-lap learning was removed; [FUTURE_lap_learning.md](FUTURE_lap_learning.md) has its design, results and code. `approach:=false` (`hw_tracking.launch.py` only) skips the drive to the start and tracks straight away.
+
 ### Quick start (one terminal)
 
 ```bash
 source install/setup.bash
-ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:=false   # /cmd_vel -> /limo1/cmd_vel (robot_ns default)
+ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc   # /cmd_vel -> /limo1/cmd_vel (robot_ns default)
 ```
 
 This starts the bridge, the controller, the builder and the live plotter. Draw a path in the builder, click **Smooth Path**, then **Publish**. With the lab obstacle:
 ```bash
-ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc rezero_odom:=false \
+ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc \
     obstacles:="[1.970681, 0.80659, 0.35]"
 ```
 
 > [!IMPORTANT]
 > **Measure `ref_offset` before tracking runs.** Measure along the robot's centre line from the rear axle to the midpoint of markers 0 and 1, and pass it with `ref_offset:=<metres>`. In a fake-robot test, a 5 cm error left 1.6–5.1 cm RMS, depending on the controller.
 >
-> **Start the controller before clicking Publish.** The path is sent once; a controller started later never receives it and waits, leaving a CSV with only a header. Clicking **Publish** again fixes it.
+> **Start the controller before clicking Publish.** The path is sent once; a controller started later never receives it and waits. Clicking **Publish** again fixes it.
 
 ### Step by step (separate terminals)
 
@@ -112,13 +184,13 @@ ros2 run limo_mocap_suite phasespace_bridge --ros-args -p "obstacles:=[1.970681,
 
 **2. A controller.** It idles until a path arrives.
 ```bash
-ros2 run limo_mocap_suite nmpc_tracker --ros-args -p rezero_odom:=false -r /cmd_vel:=/limo1/cmd_vel
+ros2 run limo_mocap_suite nmpc_tracker --ros-args -r /cmd_vel:=/limo1/cmd_vel
 # alternatives: pid_tracker, lqr_tracker, mpc_tracker (same -r remap; add -r /imu:=/limo1/imu if you like)
 ```
 
 **3. Path builder.**
 ```bash
-ros2 run limo_mocap_suite interactive_builder --ros-args -p rezero_odom:=false
+ros2 run limo_mocap_suite interactive_builder
 ```
 *   Click and drag on the canvas to draw your route.
 *   Click **Smooth Path** to apply B-spline curvature smoothing.
@@ -127,13 +199,13 @@ ros2 run limo_mocap_suite interactive_builder --ros-args -p rezero_odom:=false
 
 **4. Live plotter** (optional).
 ```bash
-ros2 run limo_mocap_suite live_plotter --ros-args -p rezero_odom:=false
+ros2 run limo_mocap_suite live_plotter
 ```
 
 > [!NOTE]
 > **Use the same `rezero_odom` value everywhere** (controller, builder, live plotter).
-> *   `false` (recommended in the lab): everything is in the absolute PhaseSpace frame, the same frame as the obstacle map.
-> *   `true` (default): coordinates are relative to the robot's pose when each node received its first odometry. The canvas origin is then the robot, facing +X. Start all nodes together, before the robot moves, so they agree on that pose.
+> *   `false` (default): everything is in the absolute PhaseSpace frame, the same frame as the obstacle map.
+> *   `true`: coordinates are relative to the robot's pose when each node received its first odometry. The canvas origin is then the robot, facing +X. Start all nodes together, before the robot moves, so they agree on that pose.
 
 ### LIMO test suite (wheels in the air, no feedback)
 
@@ -145,7 +217,7 @@ ros2 launch limo_mocap_suite limo_test.launch.py path:=circle speed:=0.15 robot_
 # or without launch (remap yourself), starting straight away:
 ros2 run limo_mocap_suite limo_test_suite --ros-args -r /cmd_vel:=/limo1/cmd_vel -p path:=circle -p speed:=0.15 -p autostart:=true
 ```
-`limo_test.launch.py` arguments: `robot_ns` (default `limo1`, `none` = plain `/cmd_vel`), `path` (default `figure8`), `speed` (default `0.20`).
+`limo_test.launch.py` arguments: `robot_ns` (default `limo1`, `none` = plain `/cmd_vel`), `path` (default `figure8`), `speed` (default `0.20`), `view` (default `behind`).
 
 *   Pick a path with the radio buttons (**straight**, **circle**, **figure8**, **drawn**), then press **Start**. After a 3 s countdown the commands begin. **STOP** (or closing the window, or Ctrl-C) sends zero velocity immediately.
 *   **Left panel, view from behind:** forward (+X) points **up** and left (+Y) points **left**, so the screen matches the robot in front of you. The grey dashed line is the test path and the orange line is the motion the commands produce. The robot glyph's arrow points along the last traced segment; it starts pointing straight up and turns with the path, as an Ackermann robot would.
@@ -175,7 +247,12 @@ The commands depend only on the path, `speed`, `wheelbase` and `max_steer`; plac
 | `controller` | `nmpc` | `pid`, `lqr`, `mpc`, `nmpc` | Which tracker to start |
 | `builder` | `true` | `true`, `false` | Start `interactive_builder` |
 | `plotter` | `true` | `true`, `false` | Start `live_plotter` |
-| `rezero_odom` | `true` | `true`, `false` | Forwarded to the controller, the builder and the plotter |
+| `track_radius` | `0.0` | metres | `0` = draw a path; above 0 = capsule track with this curve radius, no drawing window |
+| `track_straight`, `track_x`, `track_y`, `start_delay` | `3.0`, `3.75`, `2.5`, `5.0` | m, m, m, s | Capsule straight length and centre; warning before moving |
+| `guard`, `approach` | `false`, `true` | `true`, `false` | Drift guard (extension); drive to the path start first |
+| `laps` | `1` | number | Laps on a closed path; `0` = until stopped |
+| `view` | `behind` | `behind`, `topdown` | Canvas orientation of both GUIs |
+| `rezero_odom` | `false` | `true`, `false` | `false`: absolute MoCap frame. `true`: robot's start pose becomes (0,0). Forwarded to the controller, the builder and the plotter |
 | `run_duration` | `0.0` | seconds | Controller time limit; `0` = until the path end or Ctrl-C |
 | `obstacles` | `''` (none) | `"[x, y, r, ...]"` | Fixed cylinders, flat list, metres, PhaseSpace frame |
 | `obstacle_markers` | `''` (none) | `"[(0,1,2,3),(4,5,6,7)]"` | 4 marker ids on the rim of each cylinder; centre and radius come live from them |
@@ -210,9 +287,16 @@ Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) 
 | `wheelbase` | `0.20` | LIMO wheelbase L (m) |
 | `ref_offset` | `0.10` | Distance of the marker midpoint **ahead of the rear axle** (m). Measure it on your robot: 0.10 assumes the midpoint is halfway between the axles |
 | `max_steer` | `0.48869` | Steering limit (rad, 28°) |
-| `rezero_odom` | `true` | Path relative to the start pose (`true`) or absolute PhaseSpace frame (`false`) |
-| `run_duration` | `45.0` (PID), `25.0` (others) | Time limit in s; `0` = no limit. An open path also ends the run. |
-| `log_dir` | `evaluation` | Folder (relative to the launch directory) for `<ctrl>_<profile>_telemetry.csv` |
+| `rezero_odom` | `false` | Absolute PhaseSpace frame (`false`) or path relative to the start pose (`true`) |
+| `run_duration` | `0.0` | Time limit in s; `0` = no limit |
+| `log_dir`, `path_name` | `evaluation`, `drawn` | Where each run's folder goes, and the label in its name |
+| `laps`, `exit_on_finish` | `1`, `false` | Laps on a closed path (`0` = until stopped); leave when the run ends |
+| `guard`, `approach` | `false`, `true` | Slow, rejoin and stop on drift (extension); drive to the path start first |
+| `approach_radius`, `approach_speed` | `0.60`, `0.25` | Turning radius (m) and speed (m/s) on the way to the path |
+| `join_tol`, `join_heading_deg` | `0.15`, `30.0` | Closer than this to the start: no approach needed |
+| `slow_cte`, `rejoin_cte`, `abort_cte`, `max_rejoins` | `0.15`, `0.35`, `1.00`, `3` | Guard levels (m), with `guard:=true` |
+| `odom_timeout`, `odom_abort` | `0.5`, `3.0` | Odometry lost: zero command; with `guard:=true`, stop the run (s) |
+| `guard_lab_x`, `guard_lab_y` | `[-0.5, 8.0]`, `[-1.0, 6.0]` | With `guard:=true`, the robot stops outside this area |
 | `profile` | `figure8` | Only used in the CSV file name on hardware |
 
 **Controller-specific tuning**
@@ -234,13 +318,16 @@ Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) 
 | NMPC | `rd_steer` | `2.5` | Steering slew weight |
 | NMPC | `r_steer` | `0.8` | Reserved; not used in the cost |
 
-**`interactive_builder` and `live_plotter`**
+**`interactive_builder`, `live_plotter` and `limo_test_suite`**
+
+All three show the same canvas. `view:=behind`: +X (forward) up, +Y (left) left. `view:=topdown`: +X right, +Y up. Use the same value in all of them. Only the display changes: `/reference_path` always carries real X, Y, and the test suite shows a drawn path where it was drawn.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `rezero_odom` | `true` | Draw in the same frame as the controller. Must match the controller's value. |
+| `rezero_odom` | `false` | Draw in the same frame as the controller. Must match the controller's value. |
 | `lab_x` | `[-0.5, 8.0]` | X extent of the canvas (m): the lab floor covered by PhaseSpace |
 | `lab_y` | `[-1.0, 6.0]` | Y extent of the canvas (m), e.g. `-p lab_y:="[-1.0, 5.0]"` |
+| `view` | `behind` | Canvas orientation: `behind` or `topdown` |
 
 ### Topics
 
@@ -253,6 +340,8 @@ Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) 
 | `/reference_path_viz` | `nav_msgs/Path` | controllers → RViz (every 5th point) |
 | `/<robot_ns>/cmd_vel` (e.g. `/limo1/cmd_vel`) | `geometry_msgs/Twist` | controller / test suite → LIMO (nodes publish `/cmd_vel`, remapped by the launch files) |
 | `/<robot_ns>/imu` | `sensor_msgs/Imu` | LIMO → PID/LQR/MPC (unused) |
+| `/run_status` | `std_msgs/String` (JSON, 5 Hz) | controller → live view, lap test |
+| `/run_kill` | `std_msgs/Bool` (latched) | live view → controllers, lap test |
 
 ## GUIs
 
@@ -272,9 +361,13 @@ Builder and plotter elements:
 | Wall | Dashed black edge (obstacle radius ≥ 100 m) |
 | Status text (top left) | Robot position, heading in degrees, and which frame is used |
 | Builder only | Blue drawn path (green after **Smooth Path**); buttons **Smooth Path**, **Clear**, **Publish** |
-| Plotter only | Green dashed reference path; orange live trail (cleared when a new path is published) |
+| Plotter only | Green dashed reference path; orange live trail (cleared when a new path is published); **KILL / RE-ARM** button; error chart with the guard levels; steering chart with the limit and what the curve needs; controller, phase, lap and steering use |
 
 The obstacles come from the bridge, so the map the bridge uses is what both windows show and what the CBF avoids. There are none by default. Obstacles appear once the first odometry message has arrived.
+
+## Simulation demo
+
+The four-panel Gazebo demo lives in the simulation repo: see `../Ackerman_Drive/demo/README.md`. It runs these same controllers. `obstacle_mode:=constraint` on `mpc_tracker` and `nmpc_tracker` uses obstacles as MPC constraints instead of the CBF; the default stays `cbf`.
 
 ## MATLAB version
 

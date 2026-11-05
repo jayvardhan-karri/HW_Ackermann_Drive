@@ -11,6 +11,7 @@
 #                   /cmd_vel -> /<robot_ns>/cmd_vel; none = plain /cmd_vel
 #         path      straight | circle | figure8 | drawn  (default figure8)
 #         speed     m/s during the test (default 0.20)
+#         view      behind | topdown (default behind); use the same in the builder
 #
 # TAG LEGEND (grep for these to jump / skip):
 #   [CORE]   control / estimation math that decides robot motion
@@ -39,7 +40,8 @@ def _test_node(context):
         executable='limo_test_suite',
         output='screen',
         parameters=[{'path': LaunchConfiguration('path').perform(context),
-                     'speed': float(LaunchConfiguration('speed').perform(context))}],
+                     'speed': float(LaunchConfiguration('speed').perform(context)),
+                     'view': LaunchConfiguration('view').perform(context)}],
         remappings=robot_remappings(LaunchConfiguration('robot_ns').perform(context)),
     )]
 
@@ -47,7 +49,7 @@ def _test_node(context):
 # =============================================================================
 # [LIFE]   generate_launch_description()
 # -----------------------------------------------------------------------------
-# Declares robot_ns / path / speed and starts the test suite.
+# Declares robot_ns / path / speed / view and starts the test suite.
 # =============================================================================
 def generate_launch_description():
     return LaunchDescription([
@@ -56,5 +58,6 @@ def generate_launch_description():
         DeclareLaunchArgument('path', default_value='figure8',
                               description='straight | circle | figure8 | drawn'),
         DeclareLaunchArgument('speed', default_value='0.20', description='test speed (m/s)'),
+        DeclareLaunchArgument('view', default_value='behind', description='behind | topdown'),
         OpaqueFunction(function=_test_node),
     ])

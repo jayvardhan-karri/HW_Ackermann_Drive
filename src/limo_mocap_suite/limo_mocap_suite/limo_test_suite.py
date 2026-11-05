@@ -16,10 +16,12 @@
 #   straight : straight_length metres forward               (steering 0)
 #   circle   : one full LEFT circle of radius `radius`       (steer left)
 #   figure8  : full LEFT circle, then full RIGHT circle      (left, then right)
-#   drawn    : the last path received on /reference_path (e.g. from the builder),
-#              moved so it starts at the robot heading forward
-# Display: path centred on the lab grid by default (auto_place), or drawn from
-#          (start_x, start_y). Display only; it never changes the commands.
+#   drawn    : the last path received on /reference_path (e.g. from the builder);
+#              commands use its own start frame (starts at the robot, heading forward)
+# Display: built-in paths are centred on the lab grid by default (auto_place), or
+#          drawn from (start_x, start_y). A drawn path stays where it was drawn, so
+#          it matches the builder. Display only; it never changes the commands.
+# View   : parameter 'view' ('behind' by default), the same in all three GUIs.
 # Commands: v = speed, delta = atan(L * kappa(s)) clipped to max_steer,
 #           omega = v * tan(delta) / L, with s = speed * t (arc length).
 #
@@ -47,7 +49,7 @@ import matplotlib.patches as patches
 from matplotlib.widgets import Button, RadioButtons
 
 from limo_mocap_suite.plot_helpers import (
-    RobotGlyph, declare_lab_params, style_lab_axes, to_view, BODY_LENGTH, BODY_WIDTH,
+    RobotGlyph, declare_lab_params, declare_view_param, style_lab_axes, to_view, BODY_LENGTH, BODY_WIDTH,
     init_gui_ros, start_spin_thread)
 
 PATH_NAMES = ('straight', 'circle', 'figure8', 'drawn')
@@ -79,7 +81,8 @@ def path_from_segments(segments):
 # 2. move it into its own start frame (first point = origin, first segment
 #    heading = +X) so the robot starts at the origin heading forward;
 # 3. resample every DS metres of arc length;
-# 4. heading and signed curvature by finite differences (lightly smoothed).
+# 4. heading and signed curvature by finite differences (lightly smoothed);
+# 5. keep the start frame in 'origin' (x0, y0, yaw0), to display it as drawn.
 # =============================================================================
 def path_from_points(px, py):
     pts = [(px[0], py[0])]
@@ -103,7 +106,8 @@ def path_from_points(px, py):
     kappa = np.gradient(yaw) / DS
     kernel = np.ones(9) / 9.0                      # 9 cm moving average
     kappa = np.convolve(kappa, kernel, mode='same')
-    return {'s': s, 'x': x, 'y': y, 'yaw': yaw, 'kappa': kappa}
+    return {'s': s, 'x': x, 'y': y, 'yaw': yaw, 'kappa': kappa,
+            'origin': (float(p[0, 0]), float(p[0, 1]), yaw0)}
 
 
 # =============================================================================
@@ -126,7 +130,7 @@ class LimoTestSuiteNode(Node):
         self.declare_parameter('path', 'figure8')
         self.declare_parameter('speed', 0.20)
         self.declare_parameter('wheelbase', 0.20)
-        self.declare_parameter('max_steer', 0.48869)
+        self.declare_parameter('max_steer', 0.4084)  # centre angle at the driver's 28 deg inner-wheel limit (R 0.46 m)
         self.declare_parameter('radius', 0.80)
         self.declare_parameter('straight_length', 2.0)
         self.declare_parameter('start_delay', 3.0)
@@ -136,6 +140,7 @@ class LimoTestSuiteNode(Node):
         self.declare_parameter('start_x', 0.0)
         self.declare_parameter('start_y', 0.0)
         self.lab_x, self.lab_y = declare_lab_params(self)
+        self.behind_view = declare_view_param(self)
 
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.speed = float(g('speed'))
@@ -407,8 +412,10 @@ def main(args=None):
     ax_wheel = fig.add_axes([0.66, 0.50, 0.30, 0.43])
     ax_info = fig.add_axes([0.63, 0.22, 0.35, 0.26])
     ax_info.axis('off')
-    style_lab_axes(ax_path, node.lab_x, node.lab_y, 'LIMO Test Suite (view from behind)',
-                   behind_view=True)
+    behind = node.behind_view
+    style_lab_axes(ax_path, node.lab_x, node.lab_y,
+                   'LIMO Test Suite (view from behind)' if behind else 'LIMO Test Suite',
+                   behind_view=behind)
     wheels = WheelPanel(ax_wheel)
     info = ax_info.text(0.0, 1.0, '', va='top', ha='left', fontsize=14, family='monospace')
 
@@ -418,10 +425,20 @@ def main(args=None):
     end_dot, = ax_path.plot([], [], 'x', color='red', ms=14, mew=3, label='End', zorder=7)
     robot = RobotGlyph(ax_path, label='LIMO (expected)')
     ax_path.legend(loc='upper left', fontsize=11)
-    offset = {'xy': node.placement(node.path), 'legend_done': False}
+    offset = {'xy': node.placement(node.path), 'origin': None, 'legend_done': False}
 
-    def lab(x, y):
-        return to_view(x + offset['xy'][0], y + offset['xy'][1], behind_view=True)[:2]
+    # =========================================================================
+    # [UI]     lab(x, y, yaw=0.0) -> (u, v, yaw_view)  (nested)
+    # -------------------------------------------------------------------------
+    # Path-frame point to canvas: a drawn path goes back to where it was drawn
+    # (its 'origin'), a built-in path is shifted by the placement offset.
+    # =========================================================================
+    def lab(x, y, yaw=0.0):
+        if offset['origin'] is not None:
+            x0, y0, yaw0 = offset['origin']
+            c, sn = math.cos(yaw0), math.sin(yaw0)
+            return to_view(x0 + c * x - sn * y, y0 + sn * x + c * y, yaw + yaw0, behind)
+        return to_view(x + offset['xy'][0], y + offset['xy'][1], yaw, behind)
 
     radio_ax = fig.add_axes([0.66, 0.05, 0.12, 0.15])
     radio = RadioButtons(radio_ax, PATH_NAMES, active=PATH_NAMES.index(node.name))
@@ -449,18 +466,19 @@ def main(args=None):
         if p is not drawn_cache['path']:
             drawn_cache['path'] = p
             offset['xy'] = node.placement(p)
+            offset['origin'] = p.get('origin') if p is not None else None
             if p is None:
                 path_line.set_data([], [])
                 end_dot.set_data([], [])
             else:
-                u, v = lab(p['x'], p['y'])
+                u, v, _ = lab(p['x'], p['y'])
                 path_line.set_data(u, v)
-                eu, ev = lab(p['x'][-1], p['y'][-1])
+                eu, ev, _ = lab(p['x'][-1], p['y'][-1])
                 end_dot.set_data([eu], [ev])
-            su, sv = lab(0.0, 0.0)
+            su, sv, _ = lab(0.0, 0.0)
             start_dot.set_data([su], [sv])
         tr = np.array(st['trail'])
-        u, v = lab(tr[:, 0], tr[:, 1])
+        u, v, _ = lab(tr[:, 0], tr[:, 1])
         trail_line.set_data(u, v)
         # Heading: from the last traced point (>= 2 cm back) to the current one
         ex, ey, eth = st['pose']
@@ -469,8 +487,7 @@ def main(args=None):
             if math.hypot(ex - px, ey - py) >= 0.02:
                 heading = math.atan2(ey - py, ex - px)
                 break
-        gu, gv, gyaw = to_view(ex + offset['xy'][0], ey + offset['xy'][1], heading, behind_view=True)
-        robot.update(gu, gv, gyaw)
+        robot.update(*lab(ex, ey, heading))
         if not offset['legend_done']:
             ax_path.legend(loc='upper left', fontsize=11)   # glyph is visible now
             offset['legend_done'] = True

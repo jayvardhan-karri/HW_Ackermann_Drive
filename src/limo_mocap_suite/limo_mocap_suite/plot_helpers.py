@@ -9,6 +9,8 @@
 #
 # Not a node. Mostly [UI]; StartFrame is the only math (same transform as the
 # controllers' odom_cb, so the GUIs show what the controllers see).
+# All three GUIs show the same view (parameter 'view'), so a path looks the same
+# in each. Only the display is rotated: ROS messages always carry real X, Y.
 # Heading convention: robot body +x = vector from the REAR marker (id 1) to
 # the FRONT marker (id 0), exactly as computed in phasespace_bridge.py.
 #
@@ -105,6 +107,22 @@ def declare_lab_params(node):
 
 
 # =============================================================================
+# [UTIL]   declare_view_param(node) -> behind_view (bool)
+# -----------------------------------------------------------------------------
+# Declares and reads the 'view' parameter of a GUI node:
+#   'behind'  (default): +X (forward) up, +Y (left) left
+#   'topdown'          : +X right, +Y up
+# Raises on any other value.
+# =============================================================================
+def declare_view_param(node):
+    node.declare_parameter('view', 'behind')
+    view = str(node.get_parameter('view').value)
+    if view not in ('behind', 'topdown'):
+        raise ValueError(f"'view' must be 'behind' or 'topdown', got '{view}'")
+    return view == 'behind'
+
+
+# =============================================================================
 # [UI]     style_lab_axes(ax, lab_x, lab_y, title, behind_view=False)
 # -----------------------------------------------------------------------------
 # Projector-friendly lab grid:
@@ -124,6 +142,7 @@ def style_lab_axes(ax, lab_x, lab_y, title, behind_view=False):
         ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{-v + 0.0:g}'))
         ax.set_xlabel('Y (m)   <- left   |   right ->', fontsize=13, fontweight='bold')
         ax.set_ylabel('X (m)   forward ->', fontsize=13, fontweight='bold')
+        ax.format_coord = lambda u, v: f'X={v:.2f} m  Y={-u:.2f} m'   # toolbar read-out
     else:
         ax.set_xlim(*lab_x)
         ax.set_ylim(*lab_y)
@@ -154,6 +173,18 @@ def style_lab_axes(ax, lab_x, lab_y, title, behind_view=False):
 
 
 # =============================================================================
+# [UI]     lab_legend(ax, behind_view=False)
+# -----------------------------------------------------------------------------
+# Draws the legend clear of the '+X' label and the status text, for either view.
+# =============================================================================
+def lab_legend(ax, behind_view=False):
+    if behind_view:
+        ax.legend(loc='upper left', bbox_to_anchor=(0.0, 0.95))
+    else:
+        ax.legend(loc='upper right')
+
+
+# =============================================================================
 # [UTIL]   to_view(x, y, yaw=0.0, behind_view=False) -> (u, v, yaw_view)
 # -----------------------------------------------------------------------------
 # Maps lab / robot-frame coordinates to plot coordinates. Identity for the
@@ -164,6 +195,18 @@ def to_view(x, y, yaw=0.0, behind_view=False):
     if behind_view:
         return -y, x, yaw + math.pi / 2.0
     return x, y, yaw
+
+
+# =============================================================================
+# [UTIL]   from_view(u, v, behind_view=False) -> (x, y)
+# -----------------------------------------------------------------------------
+# Inverse of to_view: canvas coordinates back to real X, Y. The builder must
+# use this before publishing what was drawn. For the behind view: x = v, y = -u.
+# =============================================================================
+def from_view(u, v, behind_view=False):
+    if behind_view:
+        return v, -u
+    return u, v
 
 
 # =============================================================================
@@ -256,21 +299,22 @@ class RobotGlyph:
 
 
 # =============================================================================
-# [UI]     draw_obstacles(ax, flat, frame, old=()) -> list[Patch]
+# [UI]     draw_obstacles(ax, flat, frame, old=(), behind_view=False) -> list[Patch]
 # -----------------------------------------------------------------------------
 # Removes the previously drawn obstacle patches (old) and draws the flat
-# [x, y, r, ...] map transformed by `frame` (a ready StartFrame):
+# [x, y, r, ...] map transformed by `frame` (a ready StartFrame) and to_view:
 #   r <  WALL_RADIUS : filled red circle ('Obstacle')
 #   r >= WALL_RADIUS : dashed black circle edge (a wall; looks straight)
 # Returns the new patches so the caller can remove them next time.
 # =============================================================================
-def draw_obstacles(ax, flat, frame, old=()):
+def draw_obstacles(ax, flat, frame, old=(), behind_view=False):
     for p in old:
         p.remove()
     new = []
     first_obs, first_wall = True, True
     for i in range(0, len(flat) - 2, 3):
         ox, oy, _ = frame.apply(flat[i], flat[i + 1])
+        ox, oy, _ = to_view(ox, oy, behind_view=behind_view)
         r = flat[i + 2]
         if r < WALL_RADIUS:
             p = patches.Circle((ox, oy), r, facecolor='tomato', edgecolor='darkred',

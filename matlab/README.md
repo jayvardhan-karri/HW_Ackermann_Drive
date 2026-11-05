@@ -51,6 +51,27 @@ Outputs go to `matlab/results/`: `metrics.csv`, `comparison_paths.png`, `compari
 
 ---
 
+## 2a. Lap study: curve radius and an imperfect robot
+
+```matlab
+cd matlab/lap_study
+main_lap_study      % takes several minutes
+```
+
+A capsule track (3 m straights, 1 m curves), 3 laps per controller, on three robots: ideal, imperfect (`mismatch`) and very imperfect (`hard`), which differ in curvature gain, steering trim, servo lag, rate limit, delay and pose noise. It also sweeps the curve radius, with `max_steer` 0.4084 rad. The robots are made up. Figures and tables go to `results/lap_study/`:
+
+| File | Question |
+|---|---|
+| `laps_rms.png` | How large is the RMS error on each lap and robot? |
+| `cte_vs_s.png` | Where along the track is the error, per lap? |
+| `authority.png` | How much steering is sent, against the limit and what the geometry needs? |
+| `curvature_sweep.png` | How do error and steering use change as curves tighten? |
+| `lap_metrics.csv`, `curvature_sweep.csv` | Every number behind them |
+
+Lap-to-lap learning was removed: see `docs/FUTURE_lap_learning.md`.
+
+---
+
 ## 3. Folder layout
 
 ```
@@ -66,6 +87,12 @@ matlab/
 │   ├── build_reference.m   waypoint table: heading, curvature, speed profile, closed/open
 │   ├── ref_index.m         index wrap (closed) / clamp (open)
 │   └── tracking_errors.m   nearest point, look-ahead, cross-track and heading error, goal
+├── lap_study/
+│   ├── main_lap_study.m    capsule track, 3 laps, three robots, curvature sweep
+│   ├── capsule_path.m      the track
+│   ├── run_laps.m          closed loop against an imperfect robot, with laps
+│   ├── lap_defaults.m      lap study settings
+│   └── plot_lap_study.m, plot_curvature_sweep.m
 ├── controllers/
 │   ├── ctrl_pid.m          PID + curvature feed-forward
 │   ├── ctrl_lqr.m          gain-scheduled LQR (with gain cache)

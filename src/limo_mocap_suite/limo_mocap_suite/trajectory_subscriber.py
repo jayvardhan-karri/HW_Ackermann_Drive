@@ -43,6 +43,7 @@ class TrajectorySubscriber:
         self.path_ready = False
         self.is_closed = False
         self.goal_reached = False
+        self.new_path = False   # set by path_cb, cleared by RunManager
         self.last_idx = 0
         self.sub = self.node.create_subscription(Path, '/reference_path', self.path_cb, 10)
 
@@ -94,8 +95,22 @@ class TrajectorySubscriber:
         self.path_ready = True
         self.goal_reached = False
         self.last_idx = 0
+        self.new_path = True
         kind = 'closed loop' if self.is_closed else 'open path'
         self.node.get_logger().info(f"Received new path! Waypoints generated: {n} ({kind})")
+
+    # =========================================================================
+    # [CORE]   load_table(table, closed, start_idx)
+    # -------------------------------------------------------------------------
+    # Replaces the table being tracked: RunManager swaps between the way to the
+    # path and the path itself. Rows are [x, y, yaw, v, kappa].
+    # =========================================================================
+    def load_table(self, table, closed, start_idx=0):
+        self.waypoints = table
+        self.is_closed = closed
+        self.last_idx = int(start_idx)
+        self.goal_reached = False
+        self.path_ready = True
 
     # =========================================================================
     # [UTIL]   index(i) -> int

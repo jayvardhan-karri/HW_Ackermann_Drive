@@ -7,8 +7,10 @@
 # Console script : ros2 run limo_mocap_suite interactive_builder
 # Publishes      : /reference_path (nav_msgs/Path, frame 'odom')
 # Subscribes     : /hardware_odom (robot glyph), /hardware_obstacles (latched map)
-# Parameters     : rezero_odom (True): draw in the same frame as the controllers
+# Parameters     : rezero_odom (False): draw in the same frame as the controllers
 #                  lab_x, lab_y ([-0.5, 8.0], [-1.0, 6.0]): canvas = lab floor
+#                  view ('behind'): canvas orientation, same as the other GUIs
+# The canvas may be rotated, but /reference_path always carries real X, Y.
 # Mostly [UI]. The only ROS logic is in TrajectoryPublisherNode.
 # Robot glyph: arrow from rear marker M1 (blue) to front marker M0 (red).
 #
@@ -38,8 +40,8 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Button
 
 from limo_mocap_suite.plot_helpers import (
-    StartFrame, RobotGlyph, draw_obstacles, quat_to_yaw, declare_lab_params, style_lab_axes,
-    init_gui_ros, start_spin_thread)
+    StartFrame, RobotGlyph, draw_obstacles, quat_to_yaw, declare_lab_params, declare_view_param,
+    style_lab_axes, to_view, from_view, lab_legend, init_gui_ros, start_spin_thread)
 
 # =============================================================================
 # [ROS-IO] class TrajectoryPublisherNode(Node)
@@ -59,8 +61,9 @@ class TrajectoryPublisherNode(Node):
     def __init__(self):
         super().__init__('interactive_builder_node')
         self.path_pub = self.create_publisher(Path, '/reference_path', 10)
-        self.declare_parameter('rezero_odom', True)
+        self.declare_parameter('rezero_odom', False)
         self.lab_x, self.lab_y = declare_lab_params(self)
+        self.behind_view = declare_view_param(self)
         self.frame = StartFrame(bool(self.get_parameter('rezero_odom').value))
         self.robot_pose = None      # latest (x, y, yaw) in the PhaseSpace frame
         self.obstacles = []         # flat [x, y, r, ...]
@@ -92,7 +95,8 @@ class TrajectoryPublisherNode(Node):
     # =========================================================================
     # [ROS-IO] publish_trajectory(x_pts, y_pts)
     # -------------------------------------------------------------------------
-    # Packs the drawn points into one nav_msgs/Path and publishes it.
+    # Packs points in real X, Y (not canvas coordinates: see publish_data) into
+    # one nav_msgs/Path and publishes it.
     # For each point i: position = (x_i, y_i); yaw = direction to point i+1
     # (last point re-uses direction from i-1); yaw stored as a z-axis
     #   quaternion.
@@ -156,14 +160,16 @@ def main(args=None):
     ros_node = TrajectoryPublisherNode()
     spin_thread = start_spin_thread(ros_node)
 
-    x_min, x_max = ros_node.lab_x
-    y_min, y_max = ros_node.lab_y
-    raw_x, raw_y = [], []
+    behind = ros_node.behind_view
+    raw_x, raw_y = [], []   # stroke in CANVAS coordinates; from_view() before publishing
     drawing = False
     
     fig, ax = plt.subplots(figsize=get_dynamic_figsize())
     plt.subplots_adjust(bottom=0.15)
-    style_lab_axes(ax, ros_node.lab_x, ros_node.lab_y, 'Interactive Trajectory Builder')
+    style_lab_axes(ax, ros_node.lab_x, ros_node.lab_y, 'Interactive Trajectory Builder',
+                   behind_view=behind)
+    x_min, x_max = ax.get_xlim()
+    y_min, y_max = ax.get_ylim()
 
     line, = ax.plot([], [], 'b-', lw=2.5, label="Drawn Path")
     robot = RobotGlyph(ax)
@@ -171,7 +177,7 @@ def main(args=None):
                      va='top', fontsize=12, family='monospace',
                      bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
     overlay = {'patches': [], 'version': -1}
-    ax.legend(loc='upper right')
+    lab_legend(ax, behind)
 
     # =========================================================================
     # [UI]     on_press(event)
@@ -224,11 +230,11 @@ def main(args=None):
         if ros_node.robot_pose is None or not frame.ready:
             return
         x, y, yaw = frame.apply(*ros_node.robot_pose)
-        robot.update(x, y, yaw)
+        robot.update(*to_view(x, y, yaw, behind))
         if overlay['version'] != ros_node.obstacles_version:
-            overlay['patches'] = draw_obstacles(ax, ros_node.obstacles, frame, overlay['patches'])
+            overlay['patches'] = draw_obstacles(ax, ros_node.obstacles, frame, overlay['patches'], behind)
             overlay['version'] = ros_node.obstacles_version
-            ax.legend(loc='upper right')
+            lab_legend(ax, behind)
         mode = 'start-pose frame' if frame.rezero else 'PhaseSpace frame'
         status.set_text(f'robot ({x:+.2f}, {y:+.2f}) heading {math.degrees(yaw):+.0f} deg  [{mode}]')
         fig.canvas.draw_idle()
@@ -288,10 +294,11 @@ def main(args=None):
     # =========================================================================
     # [UI]     publish_data(event)  <- 'Publish' button
     # -------------------------------------------------------------------------
-    # If a stroke exists, hands it to ros_node.publish_trajectory().
+    # If a stroke exists, converts it from canvas coordinates to real X, Y and
+    # hands it to ros_node.publish_trajectory().
     # =========================================================================
     def publish_data(event):
-        if raw_x: ros_node.publish_trajectory(raw_x, raw_y)
+        if raw_x: ros_node.publish_trajectory(*from_view(np.array(raw_x), np.array(raw_y), behind))
 
     btn_smooth.on_clicked(apply_smoothing)
     btn_clear.on_clicked(clear_canvas)
