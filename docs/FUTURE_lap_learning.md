@@ -22,11 +22,11 @@ Values used: bin 0.05 m, `alpha` 0.6, deadband 3 mm, `lead` 0.10 m, smoothing 0.
 
 ## Where it plugs in
 
-`lap_stats.py` already keeps the per-lap numbers learning needs. To add learning back:
+`stats_lap.py` already keeps the per-lap numbers learning needs. To add learning back:
 
 | Place | Change |
 |---|---|
-| `lap_stats.py` | Replace with `LapAdapter` below, or subclass `LapStats` and add `correction()`, the table and the tuning step |
+| `stats_lap.py` | Replace with `LapAdapter` below, or subclass `LapStats` and add `correction()`, the table and the tuning step |
 | `run_manager.shape()` | On the path, add `adapter.correction(idx)` to the steering and multiply speed by `adapter.v_scale` |
 | `run_manager.command()` | Pass `steer_ctrl` (before learning) to `record()` |
 | `run_manager`, parameters | `adapt` (default false); call `on_tune(q_scale)` at the end of each lap |

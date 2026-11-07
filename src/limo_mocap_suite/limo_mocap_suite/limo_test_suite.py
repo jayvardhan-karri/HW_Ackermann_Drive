@@ -8,9 +8,11 @@
 #         front wheels should be steered, so you can compare with the real LIMO.
 #
 # Console script : ros2 run limo_mocap_suite limo_test_suite
-# Publishes      : /cmd_vel (geometry_msgs/Twist)  <- the only output
+# Publishes      : /<robot_ns>/cmd_vel (geometry_msgs/Twist)  <- the only output
+# Parameter      : robot_ns (limo1; 'none' = plain /cmd_vel)
 # Subscribes     : /reference_path (nav_msgs/Path), only for the 'drawn' path
 # No odometry / MoCap is used: every command comes from the path geometry.
+# Launched by limo_test.launch.py (open-loop, no feedback: it will not correct errors).
 #
 # Test paths (robot start frame: +X forward, +Y left):
 #   straight : straight_length metres forward               (steering 0)
@@ -32,6 +34,7 @@
 #   [LOG]    console prints and CSV telemetry (safe to skip)
 #   [LIFE]   node construction, startup and shutdown plumbing
 #   [UTIL]   small stateless helpers
+#   _name    a leading underscore = internal helper, only used inside this file/class
 # #############################################################################
 
 import math
@@ -48,11 +51,12 @@ import matplotlib.animation as animation
 import matplotlib.patches as patches
 from matplotlib.widgets import Button, RadioButtons
 
+from limo_mocap_suite.robot_topics import DEFAULT_ROBOT_NS, robot_remappings
 from limo_mocap_suite.plot_helpers import (
     RobotGlyph, declare_lab_params, declare_view_param, style_lab_axes, to_view, BODY_LENGTH, BODY_WIDTH,
     init_gui_ros, start_spin_thread)
 
-PATH_NAMES = ('straight', 'circle', 'figure8', 'drawn')
+PATH_NAMES = ('straight', 'circle', 'figure8', 'drawn')    # the choices of the radio buttons
 DS = 0.01  # path sampling step (m)
 
 
@@ -60,13 +64,16 @@ DS = 0.01  # path sampling step (m)
 # [CORE]   path_from_segments(segments) -> dict
 # -----------------------------------------------------------------------------
 # Builds a path from constant-curvature pieces [(length, kappa), ...] by
-# integrating heading and position every DS metres from the origin, heading
+# (length in m, kappa in 1/m, left turn positive), integrating heading and
+# position every DS metres from the origin, heading
 # +X. Returns dict with arrays s, x, y, yaw, kappa (all the same length).
 # =============================================================================
 def path_from_segments(segments):
+    # one kappa value per DS step
     kappa = np.concatenate([np.full(max(1, int(round(length / DS))), k) for length, k in segments])
     s = np.arange(len(kappa) + 1) * DS
     yaw = np.concatenate(([0.0], np.cumsum(kappa * DS)))
+    # midpoint heading of each step gives a better position than the start heading
     x = np.concatenate(([0.0], np.cumsum(np.cos(yaw[:-1] + 0.5 * kappa * DS) * DS)))
     y = np.concatenate(([0.0], np.cumsum(np.sin(yaw[:-1] + 0.5 * kappa * DS) * DS)))
     kappa = np.concatenate((kappa, kappa[-1:]))
@@ -76,7 +83,7 @@ def path_from_segments(segments):
 # =============================================================================
 # [CORE]   path_from_points(px, py) -> dict | None
 # -----------------------------------------------------------------------------
-# Converts a drawn path into the same format:
+# px, py: drawn points in m. Converts a drawn path into the same format (None if too short):
 # 1. drop points closer than 1 cm, need >= 4 left;
 # 2. move it into its own start frame (first point = origin, first segment
 #    heading = +X) so the robot starts at the origin heading forward;
@@ -92,6 +99,7 @@ def path_from_points(px, py):
     if len(pts) < 4:
         return None
     p = np.array(pts)
+    # local = points rotated so the first segment points along +X
     yaw0 = math.atan2(p[1, 1] - p[0, 1], p[1, 0] - p[0, 0])
     c, sn = math.cos(yaw0), math.sin(yaw0)
     d = p - p[0]
@@ -116,7 +124,8 @@ def path_from_points(px, py):
 # Holds the selected test path and plays it open loop on /cmd_vel at 50 Hz.
 # Phases: IDLE -> COUNTDOWN (zeros for start_delay s) -> RUNNING -> DONE.
 # Also dead-reckons the EXPECTED pose from the commands it sends (what the
-# robot would do on the floor), for the GUI.
+# robot would do on the floor), for the GUI. Commands and expected pose are
+# shared with the GUI thread, so they are guarded by self.lock.
 # =============================================================================
 class LimoTestSuiteNode(Node):
     # =========================================================================
@@ -142,7 +151,7 @@ class LimoTestSuiteNode(Node):
         self.lab_x, self.lab_y = declare_lab_params(self)
         self.behind_view = declare_view_param(self)
 
-        g = lambda n: self.get_parameter(n).value  # noqa: E731
+        g = lambda n: self.get_parameter(n).value  # noqa: E731  (short parameter reader)
         self.speed = float(g('speed'))
         self.L = float(g('wheelbase'))
         self.max_steer = float(g('max_steer'))
@@ -151,12 +160,12 @@ class LimoTestSuiteNode(Node):
         self.auto_place = bool(g('auto_place'))
         self.start_xy = (float(g('start_x')), float(g('start_y')))
         r, length = float(g('radius')), float(g('straight_length'))
-        circle = 2.0 * math.pi * r
+        circle = 2.0 * math.pi * r    # circumference, m
         self.paths = {
             'straight': path_from_segments([(length, 0.0)]),
             'circle': path_from_segments([(circle, 1.0 / r)]),
             'figure8': path_from_segments([(circle, 1.0 / r), (circle, -1.0 / r)]),
-            'drawn': None,
+            'drawn': None,    # filled when a /reference_path arrives
         }
 
         self.lock = threading.Lock()
@@ -164,10 +173,13 @@ class LimoTestSuiteNode(Node):
         self.name = None
         self.path = None
         self.t_phase = 0.0
-        self.v = self.delta = self.omega = 0.0
+        self.v = self.delta = self.omega = 0.0    # last command: m/s, steering rad, yaw rate rad/s
         self.select(str(g('path')))
 
-        self.cmd_pub = self.create_publisher(Twist, '/limo1/cmd_vel', 1) # updated from /cmd_vel to /limo1/cmd_vel as Limo takes Velocity commands via this topic.
+        # The LIMO takes velocity commands on its namespaced topic; 'none' = plain /cmd_vel
+        self.declare_parameter('robot_ns', DEFAULT_ROBOT_NS)
+        topic = dict(robot_remappings(self.get_parameter('robot_ns').value)).get('/cmd_vel', '/cmd_vel')
+        self.cmd_pub = self.create_publisher(Twist, topic, 1)
         self.create_subscription(Path, '/reference_path', self.path_cb, 10)
         self.timer = self.create_timer(0.02, self.tick)
         self.get_logger().info(
@@ -179,7 +191,8 @@ class LimoTestSuiteNode(Node):
     # =========================================================================
     # [ROS-IO] path_cb(msg: Path)
     # -------------------------------------------------------------------------
-    # Stores a received /reference_path as the 'drawn' test path.
+    # Stores a received /reference_path as the 'drawn' test path (ignored if it
+    # has fewer than 4 distinct points). Runs in the ROS thread.
     # =========================================================================
     def path_cb(self, msg):
         p = path_from_points([q.pose.position.x for q in msg.poses],
@@ -198,6 +211,7 @@ class LimoTestSuiteNode(Node):
     # [UTIL]   reset_expected()
     # -------------------------------------------------------------------------
     # Puts the expected robot back at the path start and clears its trail.
+    # Call with self.lock held (or from __init__).
     # =========================================================================
     def reset_expected(self):
         self.ex, self.ey, self.eth = 0.0, 0.0, 0.0
@@ -205,11 +219,12 @@ class LimoTestSuiteNode(Node):
         self.v = self.delta = self.omega = 0.0
 
     # =========================================================================
-    # [LIFE]   select(name) / start() / stop()
+    # [LIFE]   select(name) / start() / stop() / now()
     # -------------------------------------------------------------------------
     # select: choose a test path (only while not running).
     # start : begin the countdown (needs a path; 'drawn' needs a received one).
     # stop  : abort, publish one zero Twist, back to IDLE.
+    # now   : node clock in seconds.
     # =========================================================================
     def select(self, name):
         with self.lock:
@@ -257,6 +272,11 @@ class LimoTestSuiteNode(Node):
         cy = 0.5 * (self.lab_y[0] + self.lab_y[1]) - 0.5 * (path['y'].min() + path['y'].max())
         return cx, cy
 
+    # =========================================================================
+    # [UTIL]   duration() -> s
+    # -------------------------------------------------------------------------
+    # Time the selected path takes at the set speed (path length / speed).
+    # =========================================================================
     def duration(self):
         return self.path['s'][-1] / self.speed if self.path is not None else 0.0
 
@@ -279,9 +299,9 @@ class LimoTestSuiteNode(Node):
                 if t >= self.start_delay:
                     self.phase = 'RUNNING'
                     self.t_phase = self.now()
-                    self.t_last = 0.0
+                    self.t_last = 0.0    # time of the last integration step
             elif self.phase == 'RUNNING':
-                s = self.speed * t
+                s = self.speed * t    # arc length driven so far, m
                 if s >= self.path['s'][-1]:
                     msg = Twist()
                     self.v = self.delta = self.omega = 0.0
@@ -293,6 +313,7 @@ class LimoTestSuiteNode(Node):
                         self.phase = 'DONE'
                         self.get_logger().info(f'{self.name} finished')
                 else:
+                    # curvature at s -> steering that the bicycle model needs
                     kappa = float(np.interp(s, self.path['s'], self.path['kappa']))
                     self.v = self.speed
                     self.delta = max(-self.max_steer, min(self.max_steer, math.atan(self.L * kappa)))
@@ -306,7 +327,7 @@ class LimoTestSuiteNode(Node):
                     self.ey += self.v * math.sin(self.eth) * dt
                     self.eth += self.omega * dt
                     lx, ly = self.trail[-1]
-                    if math.hypot(self.ex - lx, self.ey - ly) > 0.01:
+                    if math.hypot(self.ex - lx, self.ey - ly) > 0.01:    # trail point every 1 cm
                         self.trail.append((self.ex, self.ey))
         if msg is not None:
             self.cmd_pub.publish(msg)
@@ -314,7 +335,8 @@ class LimoTestSuiteNode(Node):
     # =========================================================================
     # [UTIL]   snapshot() -> dict
     # -------------------------------------------------------------------------
-    # Thread-safe copy of everything the GUI draws.
+    # Thread-safe copy of everything the GUI draws (taken under the lock, so the
+# 50 Hz timer cannot change it halfway).
     # =========================================================================
     def snapshot(self):
         with self.lock:
@@ -332,9 +354,16 @@ class LimoTestSuiteNode(Node):
 # Top-down LIMO seen from behind (forward = up): chassis, rear wheels, and
 # FRONT wheels rotated by the commanded steering angle (left = rotated to the
 # left), plus a forward arrow scaled with the speed. Compare with the real
-# front wheels.
+# front wheels. Drawing only; no ROS.
 # =============================================================================
 class WheelPanel:
+    # =========================================================================
+    # [UI]     __init__(ax)
+    # -------------------------------------------------------------------------
+    # Draws the chassis, the rear wheels, the front wheels (kept in self.front
+    # to rotate later), the FRONT / REAR labels and the speed arrow on ax.
+    # Sizes in m, from BODY_LENGTH and BODY_WIDTH.
+    # =========================================================================
     def __init__(self, ax):
         self.ax = ax
         ax.set_xlim(-0.35, 0.35)
@@ -361,6 +390,11 @@ class WheelPanel:
                                              mutation_scale=25, lw=3, color='green')
         ax.add_patch(self.arrow)
 
+    # =========================================================================
+    # [UTIL]   _rect(cx, cy, ang) -> 4 corner points  (helper: used only in this class)
+    # -------------------------------------------------------------------------
+    # Corners of one wheel rectangle centred on (cx, cy) (m), rotated by ang (rad).
+    # =========================================================================
     def _rect(self, cx, cy, ang):
         c, s = math.cos(ang), math.sin(ang)
         hw, hl = self.wheel_w / 2.0, self.wheel_l / 2.0
@@ -400,6 +434,7 @@ class WheelPanel:
 #   btn_start  : button 'Start'  -> node.start()
 #   btn_stop   : button 'STOP'   -> node.stop()
 #   ani        : FuncAnimation, 10 Hz -> update_plot
+# Always sends a zero Twist on exit.
 # =============================================================================
 def main(args=None):
     init_gui_ros(args)  # Ctrl-C closes the window; cleanup below still runs
@@ -425,6 +460,7 @@ def main(args=None):
     end_dot, = ax_path.plot([], [], 'x', color='red', ms=14, mew=3, label='End', zorder=7)
     robot = RobotGlyph(ax_path, label='LIMO (expected)')
     ax_path.legend(loc='upper left', fontsize=11)
+    # offset: how the path-frame is placed on the canvas (see lab below)
     offset = {'xy': node.placement(node.path), 'origin': None, 'legend_done': False}
 
     # =========================================================================
@@ -434,7 +470,7 @@ def main(args=None):
     # (its 'origin'), a built-in path is shifted by the placement offset.
     # =========================================================================
     def lab(x, y, yaw=0.0):
-        if offset['origin'] is not None:
+        if offset['origin'] is not None:    # drawn path: rotate/shift back to where it was drawn
             x0, y0, yaw0 = offset['origin']
             c, sn = math.cos(yaw0), math.sin(yaw0)
             return to_view(x0 + c * x - sn * y, y0 + sn * x + c * y, yaw + yaw0, behind)
@@ -449,10 +485,11 @@ def main(args=None):
     for b in (btn_start, btn_stop):
         b.label.set_fontsize(15)
         b.label.set_fontweight('bold')
+    # Buttons call the node; the node's lock keeps this safe against the 50 Hz timer
     radio.on_clicked(lambda name: node.select(name))
     btn_start.on_clicked(lambda _e: node.start())
     btn_stop.on_clicked(lambda _e: node.stop())
-    drawn_cache = {'path': None}
+    drawn_cache = {'path': None}    # path currently drawn, to redraw only on change
 
     # =========================================================================
     # [UI]     update_plot(frame_idx)  (nested, 10 Hz)
@@ -503,7 +540,7 @@ def main(args=None):
             phase = 'waiting for /reference_path'
         else:
             phase = st['phase'] + f"   (duration {node.duration():.1f} s)"
-        sat = abs(st['delta']) >= node.max_steer - 1e-6 and st['v'] > 0
+        sat = abs(st['delta']) >= node.max_steer - 1e-6 and st['v'] > 0    # at the steering limit
         info.set_text(
             f"{phase}\n"
             f"path    : {st['name']}\n"

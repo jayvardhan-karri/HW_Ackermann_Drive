@@ -21,13 +21,15 @@
 #   [UTIL]   small stateless helpers
 # #############################################################################
 
+# Topics that belong to the robot; only these are remapped into its namespace
 ROBOT_TOPICS = ('/cmd_vel', '/imu')
-DEFAULT_ROBOT_NS = 'limo1'
+DEFAULT_ROBOT_NS = 'limo1'    # namespace of the lab LIMO
 
 
 # =============================================================================
 # [UTIL]   robot_remappings(robot_ns) -> list of (from, to)
 # -----------------------------------------------------------------------------
+# Used by the launch files: hw_tracking, run_laps, hw_check, limo_test.
 # robot_ns 'limo1' -> [('/cmd_vel', '/limo1/cmd_vel'), ('/imu', '/limo1/imu')].
 # 'none', '/' or '' -> [] (robot without namespace; use robot_ns:=none on the
 # command line, ros2 launch rejects an empty value). Leading / trailing '/'

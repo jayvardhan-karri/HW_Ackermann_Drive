@@ -14,6 +14,7 @@
 #   [LOG]    console prints and CSV telemetry (safe to skip)
 #   [LIFE]   node construction, startup and shutdown plumbing
 #   [UTIL]   small stateless helpers
+#   _name    a leading underscore = internal helper, only used inside this file/class
 # #############################################################################
 
 import math
@@ -36,7 +37,14 @@ from limo_mocap_suite.ros_compat import init_ros
 # =============================================================================
 # [CORE]   class MpcTrackerNode(Node)
 # -----------------------------------------------------------------------------
-# ROS 2 node 'mpc_tracker_node': path in, /cmd_vel out.
+# ROS 2 node 'mpc_tracker_node': path in (/reference_path), /cmd_vel out.
+# Linear time-varying MPC on the error state z = [cte, d(cte)/dt, heading_err,
+# previous steering deviation]. The finite-horizon problem is solved in closed
+# form by a backward Riccati recursion (no QP solver), every 20 ms.
+# Two obstacle modes (parameter obstacle_mode):
+#   cbf        MPC first, then ObstacleCbfLayer filters the command (default)
+#   constraint obstacles inside the optimisation (LinearObstacleMpc, mpc_obstacles.py)
+# Sign convention: cte > 0 = path on the robot's left; steer > 0 = turn left.
 # =============================================================================
 class MpcTrackerNode(Node):
     """
@@ -49,15 +57,19 @@ class MpcTrackerNode(Node):
     # [LIFE]   __init__()
     # -------------------------------------------------------------------------
     # Builds the MPC node:
-    # - declares/reads ROS parameters (v_nominal, wheelbase,
-    #   max_steer, horizon_steps, mpc_dt, q_cte, q_dcte, q_heading, r_steer,
-    #   rd_steer, lookahead_pts, rezero_odom, ref_offset)
+    # - declares/reads ROS parameters, defaults: v_nominal 0.40 m/s, wheelbase 0.20 m,
+    #   ref_offset 0.10 m, max_steer 0.4084 rad, horizon_steps 16, mpc_dt 0.04 s
+    #   (horizon 0.64 s), q_cte 520, q_dcte 35, q_heading 42, r_steer 0.28,
+    #   rd_steer 0.45, lookahead_pts 9, rezero_odom False, obstacle_mode 'cbf'
     # - creates TrajectorySubscriber (listens to /reference_path) and
-    #   ObstacleCbfLayer (CBF)
-    # - initialises pose and controller memory
-    # - creates RunManager (approach, laps, guard, kill, logging, /cmd_vel)
-    # - subscribers: /hardware_odom (Odometry), /hardware_obstacles (latched),
-    #   /imu (Imu)
+    #   ObstacleCbfLayer (CBF; it also declares robot_radius and safety_margin,
+    #   which give keep_out = robot_radius + safety_margin)
+    # - initialises pose and controller memory (prev_steer, prev_cte, int_cte)
+    # - creates LinearObstacleMpc (used only in constraint mode)
+    # - creates RunManager (approach, laps, guard, kill, logging, /cmd_vel);
+    #   its on_start callback is _reset_memory
+    # - subscribers: /hardware_odom (Odometry), /hardware_obstacles (latched, made by
+    #   ObstacleCbfLayer), /imu (Imu)
     # - timers     : control_loop @ 50 Hz (0.02 s)
     # =========================================================================
     def __init__(self):
@@ -122,10 +134,11 @@ class MpcTrackerNode(Node):
 
 
     # =========================================================================
-    # [UTIL]   quat_to_yaw(q) -> float
+    # [UTIL]   quat_to_yaw(q) -> yaw [rad]
     # -------------------------------------------------------------------------
-    # Converts a geometry_msgs Quaternion into a planar yaw angle (rad).
-    # Uses the standard ZYX formula: atan2(2(wz+xy), 1-2(y^2+z^2)).
+    # Converts a geometry_msgs Quaternion (x, y, z, w) into a planar yaw (rad).
+    # Standard ZYX formula: yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2)).
+    # Static: no node state is used. Result is in (-pi, pi].
     # =========================================================================
     @staticmethod
     def quat_to_yaw(q) -> float:
@@ -135,13 +148,15 @@ class MpcTrackerNode(Node):
     # [ROS-IO] odom_cb(msg: Odometry)
     # -------------------------------------------------------------------------
     # Callback for /hardware_odom. Stores the robot pose used by control_loop.
-    # 1. Reads raw (x, y, yaw) from the message.
-    # 2. On the FIRST message, latches it as the origin (x0, y0, yaw0)
-    #    (origin = 0 when the parameter rezero_odom is False).
-    # 3. Expresses every later pose in that frame (translate + rotate), so by
-    #    default the drawn path is RELATIVE to where the robot started.
-    # 4. Sets odom_received = True (gate for control_loop).
-    # Also caches v_actual = twist.linear.x for telemetry.
+    # Pose is the TRACKED POINT (marker midpoint, ref_offset ahead of the rear axle).
+    # 1. Reads raw (x, y, yaw) from the message (m, m, rad).
+    # 2. On the FIRST message, latches the origin (x0, y0, yaw0). The origin is the
+    #    first pose if rezero_odom is True, else (0, 0, 0): the absolute odom / MoCap
+    #    frame, which is the default.
+    # 3. Expresses every pose in that frame: translate by (x0, y0), rotate by -yaw0.
+    #    With the default origin this changes nothing.
+    # 4. Sets odom_received = True and tells RunManager (note_odom) that odom is alive.
+    # Also caches v_actual = twist.linear.x (m/s) for telemetry.
     # =========================================================================
     def odom_cb(self, msg: Odometry):
         raw_x = msg.pose.pose.position.x
@@ -152,8 +167,10 @@ class MpcTrackerNode(Node):
         dx = raw_x - self.x0
         dy = raw_y - self.y0
         c0, s0 = math.cos(self.yaw0), math.sin(self.yaw0)
+        # rotate the offset by -yaw0 (world frame -> controller frame)
         self.x = c0 * dx + s0 * dy
         self.y = -s0 * dx + c0 * dy
+        # wrap the yaw difference to (-pi, pi]
         self.yaw = math.atan2(math.sin(raw_yaw - self.yaw0), math.cos(raw_yaw - self.yaw0))
         self.v_actual = msg.twist.twist.linear.x
         self.odom_received = True
@@ -162,23 +179,29 @@ class MpcTrackerNode(Node):
     # =========================================================================
     # [ROS-IO] imu_cb(msg: Imu)
     # -------------------------------------------------------------------------
-    # Callback for /imu. Intentionally empty (placeholder for yaw-rate
-    #   damping).
+    # Callback for /imu. Intentionally empty: placeholder for yaw-rate damping.
+    # The message is received but not used by the control law.
     # =========================================================================
     def imu_cb(self, msg: Imu):
         pass
 
     # =========================================================================
     # [CORE]   _solve_ltv_mpc(cte, d_cte, heading_err, nearest_idx) -> (v, steer)
+    #          (helper of control_loop)
     # -------------------------------------------------------------------------
-    # 1. Sample N reference points ahead, advancing v_ref*dt of arc length
-    #   each.
-    # 2. Backward Riccati recursion k = N-1..0 with step-dependent A_k, B_k
-    #    (built from v_k, kappa_k), terminal P = 3Q, R_eff = r_steer +
-    #      rd_steer.
-    # 3. Feed-forward = weighted mean of atan(L*kappa_k) over the first 5
-    #   steps.
-    # 4. du = -K_0 . z;  steer = ff + du + 0.06*int(cte); clip.
+    # Inputs: cte (m), d_cte (m/s), heading_err (rad), nearest path index.
+    # Outputs: speed v (m/s) and steering (rad) for this tick.
+    # 1. Sample N reference points ahead (row k = [x, y, yaw, v, kappa]), advancing
+    #    v_k*dt of arc length per step. Row 0 is the nearest point.
+    # 2. Backward Riccati recursion k = N-1..0 on z = [cte, d_cte, heading_err, prev_du],
+    #    with step-dependent A_k, B_k built from v_k, kappa_k. Cost: Q = diag(q_cte,
+    #    q_dcte, q_heading, rd_steer), terminal P = 3Q, input weight R_eff = r_steer +
+    #    rd_steer. Per step: S = R_eff + B^T P B, K_k = B^T P A / S,
+    #    P <- Q + A^T P (A - B K_k). Only K_0 is used (receding horizon).
+    # 3. Feed-forward = weighted mean of atan(L*kappa_k) over the first 5 steps
+    #    (weights 0.45, 0.25, 0.15, 0.10, 0.05).
+    # 4. du = -K_0 . z;  steer = ff + du + 0.06*int(cte); clipped to +-max_steer.
+    #    z[3] = previous steering minus ff, so the steering rate is penalised.
     # 5. Speed: same heuristic profile as PID (fair comparison).
     # =========================================================================
     def _solve_ltv_mpc(self, cte: float, d_cte: float, heading_err: float, nearest_idx: int):
@@ -191,6 +214,7 @@ class MpcTrackerNode(Node):
         L = self.wheelbase
 
         # 1. Sample time-varying reference horizon (v_k, kappa_k) along trajectory
+        # rows: [x, y, yaw, v, kappa]
         ref_horizon = np.zeros((self.N, 5), dtype=np.float64)
         curr_idx = float(nearest_idx)
         for k in range(self.N):
@@ -199,22 +223,28 @@ class MpcTrackerNode(Node):
             nxt_pt = self.traj.waypoints[self.traj.index(idx_int + 1)]
             ds = max(math.hypot(nxt_pt[0] - pt_k[0], nxt_pt[1] - pt_k[1]), 1e-3)
             ref_horizon[k] = pt_k
+            # index step = (distance driven in dt) / (waypoint spacing)
             curr_idx += (pt_k[3] * dt) / ds
 
         # 2. Backward Riccati recursion on z_k = [cte, d_cte, heading_err, prev_du]^T
         Q = np.diag([self.q_cte, self.q_dcte, self.q_heading, self.rd_steer])
+        # terminal cost: 3x the stage cost
         P = Q * 3.0
 
         K_seq = np.zeros((self.N, 4), dtype=np.float64)
         ff_steers = np.zeros(self.N, dtype=np.float64)
 
         for k in range(self.N - 1, -1, -1):
+            # floor the speed (m/s): the model degenerates near 0
             vk = max(float(ref_horizon[k, 3]), 0.15)
             kk = float(ref_horizon[k, 4])
             ff_steers[k] = math.atan(L * kk)
             sec2 = 1.0 + (L * kk) ** 2
+            # heading change per rad of steering per step: v*dt*sec^2/L
             b_yaw = (vk * dt * sec2) / L
 
+            # z_next = A z + B du. The 0.35 and 0.20 are empirical damping gains of the
+            # lateral rows (not derived); the last row is zero: prev_du becomes the new du.
             A = np.array([
                 [1.0, 0.35 * dt, vk * dt, 0.0],
                 [0.0, 0.20,      vk,      0.0],
@@ -222,12 +252,14 @@ class MpcTrackerNode(Node):
                 [0.0, 0.0,       0.0,     0.0]
             ], dtype=np.float64)
             B = np.array([
+                # sign: steering left reduces "path minus robot" errors
                 [-0.5 * vk * dt * b_yaw],
                 [-vk * b_yaw / dt],
                 [-b_yaw],
                 [1.0]
             ], dtype=np.float64)
 
+            # scalar input weight: size + rate of change lumped together
             R_eff = self.r_steer + self.rd_steer
             S = float(R_eff + (B.T @ P @ B)[0, 0])
             K_k = (B.T @ P @ A) / S
@@ -242,6 +274,7 @@ class MpcTrackerNode(Node):
         state_vec = np.array([cte, d_cte, heading_err, prev_du], dtype=np.float64)
         du_opt = -float(np.dot(K_seq[0], state_vec))
 
+        # 0.06 = small integral gain (int_cte is clamped to +-0.5 m*s)
         steer_opt = d_ff_preview + du_opt + 0.06 * self.int_cte
         steer_opt = float(np.clip(steer_opt, -self.max_steer, self.max_steer))
 
@@ -256,11 +289,15 @@ class MpcTrackerNode(Node):
     # -------------------------------------------------------------------------
     # 50 Hz (0.02 s) timer callback. RunManager.tick() decides whether there is anything
     # to drive (it handles waiting, the approach, laps, the guard and the kill).
-    # 1. RunManager.tick() -> cte, heading_err, ref point (None: nothing to do).
-    # 2. d(cte)/dt, clamped integral, _solve_ltv_mpc() (timed in ms).
+    # 1. RunManager.tick() -> cte (m), heading_err (rad), nearest index, dt (s).
+    #    None means nothing to do this tick.
+    # 2. d(cte)/dt (backward difference), integral of cte clamped to +-0.5 m*s, then
+    #    _solve_ltv_mpc() (timed in ms, logged as solve_ms).
+    #    In obstacle_mode 'constraint' it calls _constraint_step() instead.
     # 3. RunManager.shape(): guard speed factor.
     # 4. ObstacleCbfLayer.apply(): closest safe (v, steer) on the known obstacles.
-    # 5. RunManager.command(): publish /cmd_vel, lap statistics, CSV row.
+    # 5. RunManager.command(): publish /cmd_vel, lap statistics, CSV row, then
+    #    prev_steer = the steering actually sent (after shape and CBF).
     # =========================================================================
     def control_loop(self):
         tick = self.run.tick(self.x, self.y, self.yaw, self.lookahead_pts)
@@ -289,9 +326,15 @@ class MpcTrackerNode(Node):
 
     # =========================================================================
     # [CORE]   _constraint_step(cte, heading_err, nearest_idx)
+    #          (helper of control_loop)
     # -------------------------------------------------------------------------
     # obstacle_mode:=constraint: obstacles as bounds in the QP (mpc_obstacles.py).
-    # The CBF filter is not used.
+    # The CBF filter is not used. Steps:
+    # 1. Obstacles into the controller frame (world_obstacles), 3 s reference (sample_reference).
+    # 2. LinearObstacleMpc.solve() -> steering (rad) and slack (m; > 0 = no safe plan).
+    # 3. Speed from the reference with the PID speed law, then RunManager.shape().
+    # 4. speed_for_plan(): slows or stops if the slack says the plan is not safe.
+    # 5. RunManager.command() and prev_steer, as in control_loop.
     # =========================================================================
     def _constraint_step(self, cte, heading_err, nearest_idx):
         obstacles = world_obstacles(self.safety, self.x0, self.y0, self.yaw0)
@@ -307,9 +350,10 @@ class MpcTrackerNode(Node):
         self.prev_steer = self.run.steer
 
     # =========================================================================
-    # [LIFE]   _reset_memory()
+    # [LIFE]   _reset_memory()  (helper: only used in this class, as RunManager on_start)
     # -------------------------------------------------------------------------
-    # Start of a run: clear the integral and the previous steering.
+    # Start of a run: clear the integral, the previous cte and the previous steering,
+    # and the obstacle MPC state (committed passing sides, warm start).
     # =========================================================================
     def _reset_memory(self):
         self.int_cte = 0.0
@@ -322,8 +366,10 @@ class MpcTrackerNode(Node):
 # [LIFE]   main(args=None)
 # -----------------------------------------------------------------------------
 # Console-script entry point (mpc_tracker).
-# init rclpy -> construct node -> spin until Ctrl-C / SystemExit ->
-# stop robot, destroy node, shutdown rclpy.
+# init rclpy -> construct MpcTrackerNode -> spin until Ctrl-C / SystemExit ->
+# stop robot (node.run.shutdown), destroy node, shutdown rclpy.
+# init_ros keeps the ROS context alive on Ctrl-C, so the stop command can still
+# be published in the finally block.
 # =============================================================================
 def main(args=None):
     # Plain Python SIGINT handling: Ctrl-C raises KeyboardInterrupt but keeps the

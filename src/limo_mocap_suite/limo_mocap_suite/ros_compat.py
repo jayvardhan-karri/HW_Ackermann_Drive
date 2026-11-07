@@ -23,6 +23,7 @@
 
 import rclpy
 
+# Humble and newer have SignalHandlerOptions; Foxy does not, so the import is optional
 try:                                    # Humble and newer
     from rclpy.signals import SignalHandlerOptions
 except ImportError:                     # Foxy / Galactic

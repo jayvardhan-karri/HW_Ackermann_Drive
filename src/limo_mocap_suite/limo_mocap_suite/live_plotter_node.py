@@ -12,7 +12,7 @@
 # KILL button    : every controller stops and refuses to move until RE-ARM. It relies
 #                  on this window and ROS running; it is not a hardware stop.
 # Parameters     : rezero_odom (False): must match the controller's value
-#                  lab_x, lab_y ([-0.5, 8.0], [-1.0, 6.0]): canvas = lab floor
+#                  lab_x, lab_y ([-0.5, 7.0], [-0.5, 3.0]): canvas = lab floor
 #                  view ('behind'): canvas orientation, same as the other GUIs
 # Robot glyph    : arrow from rear marker M1 (blue) to front marker M0 (red),
 #                  so the heading is readable without the Gazebo view.
@@ -58,9 +58,11 @@ class LivePlotterNode(Node):
     # =========================================================================
     # [LIFE]   __init__()
     # -------------------------------------------------------------------------
-    # Reads rezero_odom and lab_x / lab_y, creates the StartFrame, the buffers
-    # and the three
-    # subscriptions (/hardware_obstacles with latched QoS).
+    # Reads rezero_odom, lab_x / lab_y and view, creates the StartFrame (maps the
+    # mocap pose into the controller's frame) and the buffers. Subscribes to
+    # /reference_path, /hardware_odom, /hardware_obstacles (latched QoS) and
+    # /run_status; publishes /run_kill (latched) and /cmd_vel. A 10 Hz timer
+    # (kill_tick) repeats the zero command while KILL is on.
     # =========================================================================
     def __init__(self):
         super().__init__('live_plotter_node')
@@ -69,11 +71,12 @@ class LivePlotterNode(Node):
         self.lab_x, self.lab_y = declare_lab_params(self)
         self.behind_view = declare_view_param(self)
 
+        # Data for the animation, written by the ROS thread, read by the GUI thread
         self.ref_x, self.ref_y = [], []
         self.trail_x, self.trail_y = [], []
         self.pose = None            # (x, y, yaw) in the controller frame
         self.obstacles = []
-        self.obstacles_version = 0
+        self.obstacles_version = 0    # +1 per new map, so the GUI redraws only then
 
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(Path, '/reference_path', self.path_cb, 10)
@@ -120,17 +123,17 @@ class LivePlotterNode(Node):
     # =========================================================================
     # [ROS-IO] obstacles_cb(msg: Float32MultiArray)
     # -------------------------------------------------------------------------
-    # Caches the bridge's obstacle map (flat [x, y, r, ...]).
+    # Caches the bridge's obstacle map (flat [x, y, r, ...], m).
     # =========================================================================
     def obstacles_cb(self, msg):
         self.obstacles = list(msg.data)
         self.obstacles_version += 1
 
-
     # =========================================================================
     # [ROS-IO] status_cb(msg: String)
     # -------------------------------------------------------------------------
     # Latest controller report (JSON) and the history for the two strip charts.
+    # Only the APPROACH and TRACK phases add a point (cte m, steer rad, steer_ff rad).
     # =========================================================================
     def status_cb(self, msg):
         self.status = json.loads(msg.data)
@@ -140,7 +143,7 @@ class LivePlotterNode(Node):
             self.hist.append((self.status_time, s['cte'], s['steer'], s['steer_ff']))
 
     # =========================================================================
-    # [ROS-IO] set_kill(on) / kill_tick()
+    # [ROS-IO] set_kill(on: bool) / kill_tick()
     # -------------------------------------------------------------------------
     # KILL latches /run_kill (a controller started later sees it too) and keeps
     # sending zero commands, in case a controller is not listening. RE-ARM clears it.
@@ -152,6 +155,7 @@ class LivePlotterNode(Node):
             self.cmd_pub.publish(Twist())
             self.get_logger().error('KILL pressed')
 
+    # 10 Hz timer: repeats the zero command while KILL is on.
     def kill_tick(self):
         if self.killed:
             self.cmd_pub.publish(Twist())
@@ -192,6 +196,11 @@ def main(args=None):
     btn_kill.label.set_fontweight('bold')
     btn_kill.label.set_color('white')
 
+    # =========================================================================
+    # [UI]     on_kill(_event)  (nested)
+    # -------------------------------------------------------------------------
+    # KILL button click: toggles KILL / RE-ARM, and the button label and colour.
+    # =========================================================================
     def on_kill(_event):
         node.set_kill(not node.killed)
         btn_kill.label.set_text('RE-ARM' if node.killed else 'KILL')
@@ -230,10 +239,11 @@ def main(args=None):
         return to_view(np.array(xs[:n]), np.array(ys[:n]), behind_view=behind)[:2]
 
     # =========================================================================
-    # [UI]     update_plot(frame_idx)  (nested)
+    # [UI]     update_side(now)  (nested)
     # -------------------------------------------------------------------------
-    # Animation callback: path, trail, robot glyph, obstacles (only when a new
-    # map arrived) and the status text.
+    # Right-hand panel: the two strip charts (last 60 s; now = time.monotonic())
+    # and the info text. Text turns red when no report arrives for 1.5 s, on
+    # KILL / ABORT, or when the guard is in REJOIN / HOLD.
     # =========================================================================
     def update_side(now):
         st = node.status
@@ -252,7 +262,7 @@ def main(args=None):
             return
         limit = math.degrees(st['max_steer'])
         ax_steer.set_ylim(-1.15 * limit, 1.15 * limit)
-        if not getattr(ax_steer, 'limit_drawn', False):
+        if not getattr(ax_steer, 'limit_drawn', False):    # limit lines are drawn once
             ax_steer.axhline(limit, color='#c62828', lw=1.5)
             ax_steer.axhline(-limit, color='#c62828', lw=1.5)
             ax_steer.limit_drawn = True
@@ -272,6 +282,12 @@ def main(args=None):
         bad = silent or st['phase'] == 'KILLED' or st['result'] in ('ABORTED', 'KILLED') or st['guard'] in ('REJOIN', 'HOLD')
         info.set_color('#c62828' if bad else 'black')
 
+    # =========================================================================
+    # [UI]     update_plot(_frame_idx)  (nested)
+    # -------------------------------------------------------------------------
+    # Animation callback, 10 Hz: side panel, path, trail, robot glyph, obstacles
+    # (only when a new map arrived) and the status text.
+    # =========================================================================
     def update_plot(_frame_idx):
         update_side(time.monotonic())
         ref_line.set_data(*view_xy(node.ref_x, node.ref_y))
@@ -286,6 +302,7 @@ def main(args=None):
             overlay['version'] = node.obstacles_version
             lab_legend(ax, behind)
 
+    # Keep a reference to ani, or Matplotlib stops the animation
     ani = animation.FuncAnimation(fig, update_plot, interval=100, cache_frame_data=False)  # noqa: F841
 
     try:

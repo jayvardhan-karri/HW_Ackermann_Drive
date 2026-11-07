@@ -2,7 +2,7 @@
 # [FILE]   lqr_tracker_node.py
 # -----------------------------------------------------------------------------
 # FILE  : src/limo_mocap_suite/limo_mocap_suite/lqr_tracker_node.py
-# ROLE  : Continuous-time LQR tracker, gain re-solved every step.
+# ROLE  : Continuous-time LQR tracker: gain from the Riccati equation, cached per operating point.
 #
 # Console script : ros2 run limo_mocap_suite lqr_tracker
 # Law            : steer = atan(L*kappa) + k_cte*cte + k_h*heading_err
@@ -14,6 +14,7 @@
 #   [LOG]    console prints and CSV telemetry (safe to skip)
 #   [LIFE]   node construction, startup and shutdown plumbing
 #   [UTIL]   small stateless helpers
+#   _name    a leading underscore = internal helper, only used inside this file/class
 # #############################################################################
 
 import math
@@ -34,7 +35,13 @@ from limo_mocap_suite.ros_compat import init_ros
 # =============================================================================
 # [CORE]   class LqrTrackerNode(Node)
 # -----------------------------------------------------------------------------
-# ROS 2 node 'lqr_tracker_node': path in, /cmd_vel out.
+# ROS 2 node 'lqr_tracker_node': path in (/reference_path), /cmd_vel out.
+# Kinematic LQR on the error state e = [cte, heading_err]. Per tick:
+#   RunManager.tick -> LQR gain K -> steer = feed-forward + K.e -> shape -> CBF
+#   -> RunManager.command.
+# K comes from the continuous algebraic Riccati equation (scipy) and is cached by
+# (v, kappa), because the gain only depends on the operating point.
+# Sign convention: cte > 0 = path on the robot's left; steer > 0 = turn left.
 # =============================================================================
 class LqrTrackerNode(Node):
     """Hardware-transferable Kinematic LQR Trajectory Tracker (Algebraic Riccati Equation)."""
@@ -43,14 +50,15 @@ class LqrTrackerNode(Node):
     # [LIFE]   __init__()
     # -------------------------------------------------------------------------
     # Builds the LQR node:
-    # - declares/reads ROS parameters (v_nominal, wheelbase,
-    #   max_steer, q_cte, q_heading, r_steer, lookahead_pts, rezero_odom, ref_offset)
+    # - declares/reads ROS parameters, defaults: v_nominal 0.40 m/s, wheelbase 0.20 m,
+    #   ref_offset 0.10 m, max_steer 0.4084 rad, q_cte 450, q_heading 35, r_steer 0.5,
+    #   lookahead_pts 8, rezero_odom False
     # - creates TrajectorySubscriber (listens to /reference_path) and
     #   ObstacleCbfLayer (CBF)
-    # - initialises pose and controller memory
+    # - initialises pose and the gain cache _gain_cache = {} (LQR has no run memory)
     # - creates RunManager (approach, laps, guard, kill, logging, /cmd_vel)
-    # - subscribers: /hardware_odom (Odometry), /hardware_obstacles (latched),
-    #   /imu (Imu)
+    # - subscribers: /hardware_odom (Odometry), /hardware_obstacles (latched, made by
+    #   ObstacleCbfLayer), /imu (Imu)
     # - timers     : control_loop @ 50 Hz (0.02 s)
     # =========================================================================
     def __init__(self):
@@ -100,10 +108,11 @@ class LqrTrackerNode(Node):
 
 
     # =========================================================================
-    # [UTIL]   quat_to_yaw(q) -> float
+    # [UTIL]   quat_to_yaw(q) -> yaw [rad]
     # -------------------------------------------------------------------------
-    # Converts a geometry_msgs Quaternion into a planar yaw angle (rad).
-    # Uses the standard ZYX formula: atan2(2(wz+xy), 1-2(y^2+z^2)).
+    # Converts a geometry_msgs Quaternion (x, y, z, w) into a planar yaw (rad).
+    # Standard ZYX formula: yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2)).
+    # Static: no node state is used. Result is in (-pi, pi].
     # =========================================================================
     @staticmethod
     def quat_to_yaw(q) -> float:
@@ -113,13 +122,15 @@ class LqrTrackerNode(Node):
     # [ROS-IO] odom_cb(msg: Odometry)
     # -------------------------------------------------------------------------
     # Callback for /hardware_odom. Stores the robot pose used by control_loop.
-    # 1. Reads raw (x, y, yaw) from the message.
-    # 2. On the FIRST message, latches it as the origin (x0, y0, yaw0)
-    #    (origin = 0 when the parameter rezero_odom is False).
-    # 3. Expresses every later pose in that frame (translate + rotate), so by
-    #    default the drawn path is RELATIVE to where the robot started.
-    # 4. Sets odom_received = True (gate for control_loop).
-    # Also caches v_actual = twist.linear.x for telemetry.
+    # Pose is the TRACKED POINT (marker midpoint, ref_offset ahead of the rear axle).
+    # 1. Reads raw (x, y, yaw) from the message (m, m, rad).
+    # 2. On the FIRST message, latches the origin (x0, y0, yaw0). The origin is the
+    #    first pose if rezero_odom is True, else (0, 0, 0): the absolute odom / MoCap
+    #    frame, which is the default.
+    # 3. Expresses every pose in that frame: translate by (x0, y0), rotate by -yaw0.
+    #    With the default origin this changes nothing.
+    # 4. Sets odom_received = True and tells RunManager (note_odom) that odom is alive.
+    # Also caches v_actual = twist.linear.x (m/s) for telemetry.
     # =========================================================================
     def odom_cb(self, msg: Odometry):
         raw_x = msg.pose.pose.position.x
@@ -130,8 +141,10 @@ class LqrTrackerNode(Node):
         dx = raw_x - self.x0
         dy = raw_y - self.y0
         c0, s0 = math.cos(self.yaw0), math.sin(self.yaw0)
+        # rotate the offset by -yaw0 (world frame -> controller frame)
         self.x = c0 * dx + s0 * dy
         self.y = -s0 * dx + c0 * dy
+        # wrap the yaw difference to (-pi, pi]
         self.yaw = math.atan2(math.sin(raw_yaw - self.yaw0), math.cos(raw_yaw - self.yaw0))
         self.v_actual = msg.twist.twist.linear.x
         self.odom_received = True
@@ -140,19 +153,24 @@ class LqrTrackerNode(Node):
     # =========================================================================
     # [ROS-IO] imu_cb(msg: Imu)
     # -------------------------------------------------------------------------
-    # Callback for /imu. Intentionally empty (placeholder for yaw-rate
-    #   damping).
+    # Callback for /imu. Intentionally empty: placeholder for yaw-rate damping.
+    # The message is received but not used by the control law.
     # =========================================================================
     def imu_cb(self, msg: Imu):
         pass
 
     # =========================================================================
     # [CORE]   _solve_lqr_gain(v, kappa) -> [k_cte, k_heading]
+    #          (helper of solve_lqr_gain_cached)
     # -------------------------------------------------------------------------
-    # Linear error model e = [cte, heading_err], u = steer:
+    # Inputs: speed v (m/s) and path curvature kappa (1/m).
+    # Linear error model, state e = [cte, heading_err], input u = steering (rad):
     #   A = [[0, v], [0, 0]],  B = [[0], [v*(1+(L*kappa)^2)/L]]
+    #   (cte changes with v*heading_err; heading changes with the yaw rate
+    #   v*tan(u)/L, linearised: d(tan)/du = 1 + tan^2 = 1 + (L*kappa)^2 at the
+    #   feed-forward angle)
     # Solves the continuous algebraic Riccati equation (scipy) with
-    # Q = diag(q_cte, q_heading), R = r_steer, returns K = R^-1 B^T P.
+    # Q = diag(q_cte, q_heading), R = r_steer, returns K = R^-1 B^T P (row 0).
     # Falls back to K = [2.5, 1.2] if the solver throws.
     # =========================================================================
     def _solve_lqr_gain(self, v: float, kappa: float):
@@ -161,6 +179,7 @@ class LqrTrackerNode(Node):
           e_dot = A e + B u
         """
         L = self.wheelbase
+        # sec^2 of the feed-forward steering angle atan(L*kappa)
         sec2 = 1.0 + (L * kappa) ** 2
 
         # State: [e_cte, e_heading]^T, Input: steering delta
@@ -188,8 +207,12 @@ class LqrTrackerNode(Node):
     # -------------------------------------------------------------------------
     # 50 Hz (0.02 s) timer callback. RunManager.tick() decides whether there is anything
     # to drive (it handles waiting, the approach, laps, the guard and the kill).
-    # 1. RunManager.tick() -> cte, heading_err, ref point (None: nothing to do).
-    # 2. K = solve_lqr_gain_cached(v, kappa); steer = ff + K.e; same speed law as PID.
+    # 1. RunManager.tick() -> cte (m), heading_err (rad), lookahead ref point, nearest
+    #    index, dt (s). None means nothing to do this tick.
+    # 2. K = solve_lqr_gain_cached(v_ref, kappa_ref) from the lookahead point;
+    #      steer = atan(L*kappa) + K[0]*cte + K[1]*heading_err, clipped to +-max_steer.
+    #    cte and heading_err are "path minus robot", so K is added, not subtracted.
+    #    Speed: same law as PID, v = v_ref * max(0.4, 1 - 0.5*|steer|/max_steer).
     # 3. RunManager.shape(): guard speed factor.
     # 4. ObstacleCbfLayer.apply(): closest safe (v, steer) on the known obstacles.
     # 5. RunManager.command(): publish /cmd_vel, lap statistics, CSV row.
@@ -215,11 +238,12 @@ class LqrTrackerNode(Node):
 
 
     # =========================================================================
-    # [UTIL]   solve_lqr_gain_cached(v, kappa)
+    # [UTIL]   solve_lqr_gain_cached(v, kappa) -> [k_cte, k_heading]
     # -------------------------------------------------------------------------
     # Memoises _solve_lqr_gain on (v rounded to 1 mm/s, kappa rounded to
-    # 0.01 1/m), so repeated operating points skip the Riccati solve. The
-    # cache is cleared once it holds 5000 entries.
+    # 0.01 1/m), so repeated operating points skip the Riccati solve. The solver
+    # is called with the rounded values. The cache is cleared once it holds
+    # 5000 entries.
     # =========================================================================
     def solve_lqr_gain_cached(self, v, kappa):
         key = (round(v, 3), round(kappa, 2))
@@ -233,8 +257,10 @@ class LqrTrackerNode(Node):
 # [LIFE]   main(args=None)
 # -----------------------------------------------------------------------------
 # Console-script entry point (lqr_tracker).
-# init rclpy -> construct node -> spin until Ctrl-C / SystemExit ->
-# stop robot, destroy node, shutdown rclpy.
+# init rclpy -> construct LqrTrackerNode -> spin until Ctrl-C / SystemExit ->
+# stop robot (node.run.shutdown), destroy node, shutdown rclpy.
+# init_ros keeps the ROS context alive on Ctrl-C, so the stop command can still
+# be published in the finally block.
 # =============================================================================
 def main(args=None):
     # Plain Python SIGINT handling: Ctrl-C raises KeyboardInterrupt but keeps the

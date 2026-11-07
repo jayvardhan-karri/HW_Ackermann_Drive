@@ -15,6 +15,7 @@
 #   [LOG]    console prints and CSV telemetry (safe to skip)
 #   [LIFE]   node construction, startup and shutdown plumbing
 #   [UTIL]   small stateless helpers
+#   _name    a leading underscore = internal helper, only used inside this file/class
 # #############################################################################
 
 import math
@@ -34,7 +35,12 @@ from limo_mocap_suite.ros_compat import init_ros
 # =============================================================================
 # [CORE]   class PidTrackerNode(Node)
 # -----------------------------------------------------------------------------
-# ROS 2 node 'pid_tracker_node': path in, /cmd_vel out.
+# ROS 2 node 'pid_tracker_node': path in (/reference_path), /cmd_vel out.
+# Kinematic Ackermann PID with curvature feed-forward. Chain every tick:
+#   RunManager.tick -> PID law -> RunManager.shape -> ObstacleCbfLayer.apply
+#   -> RunManager.command.
+# Memory: integral_cte (m*s, clamped +-0.5) and prev_cte (m, for the derivative).
+# Sign convention: cte > 0 = path on the robot's left; steer > 0 = turn left.
 # =============================================================================
 class PidTrackerNode(Node):
     """Hardware-transferable Kinematic Ackermann PID Trajectory Tracker."""
@@ -43,14 +49,16 @@ class PidTrackerNode(Node):
     # [LIFE]   __init__()
     # -------------------------------------------------------------------------
     # Builds the PID node:
-    # - declares/reads ROS parameters (v_nominal, kp_cte, ki_cte,
-    #   kd_cte, kp_heading, wheelbase, max_steer, lookahead_pts, rezero_odom, ref_offset)
+    # - declares/reads ROS parameters, defaults: v_nominal 0.40 m/s, kp_cte 1.8,
+    #   ki_cte 0.05, kd_cte 0.45, kp_heading 1.15, wheelbase 0.20 m, ref_offset 0.10 m,
+    #   max_steer 0.4084 rad, lookahead_pts 10, rezero_odom False
     # - creates TrajectorySubscriber (listens to /reference_path) and
     #   ObstacleCbfLayer (CBF)
-    # - initialises pose and controller memory
-    # - creates RunManager (approach, laps, guard, kill, logging, /cmd_vel)
-    # - subscribers: /hardware_odom (Odometry), /hardware_obstacles (latched),
-    #   /imu (Imu)
+    # - initialises pose and controller memory (integral_cte, prev_cte)
+    # - creates RunManager (approach, laps, guard, kill, logging, /cmd_vel);
+    #   its on_start callback is _reset_memory
+    # - subscribers: /hardware_odom (Odometry), /hardware_obstacles (latched, made by
+    #   ObstacleCbfLayer), /imu (Imu)
     # - timers     : control_loop @ 50 Hz (0.02 s)
     # =========================================================================
     def __init__(self):
@@ -108,10 +116,11 @@ class PidTrackerNode(Node):
 
 
     # =========================================================================
-    # [UTIL]   quat_to_yaw(q) -> float
+    # [UTIL]   quat_to_yaw(q) -> yaw [rad]
     # -------------------------------------------------------------------------
-    # Converts a geometry_msgs Quaternion into a planar yaw angle (rad).
-    # Uses the standard ZYX formula: atan2(2(wz+xy), 1-2(y^2+z^2)).
+    # Converts a geometry_msgs Quaternion (x, y, z, w) into a planar yaw (rad).
+    # Standard ZYX formula: yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2)).
+    # Static: no node state is used. Result is in (-pi, pi].
     # =========================================================================
     @staticmethod
     def quat_to_yaw(q) -> float:
@@ -123,13 +132,15 @@ class PidTrackerNode(Node):
     # [ROS-IO] odom_cb(msg: Odometry)
     # -------------------------------------------------------------------------
     # Callback for /hardware_odom. Stores the robot pose used by control_loop.
-    # 1. Reads raw (x, y, yaw) from the message.
-    # 2. On the FIRST message, latches it as the origin (x0, y0, yaw0)
-    #    (origin = 0 when the parameter rezero_odom is False).
-    # 3. Expresses every later pose in that frame (translate + rotate), so by
-    #    default the drawn path is RELATIVE to where the robot started.
-    # 4. Sets odom_received = True (gate for control_loop).
-    # Also caches v_actual = twist.linear.x for telemetry.
+    # Pose is the TRACKED POINT (marker midpoint, ref_offset ahead of the rear axle).
+    # 1. Reads raw (x, y, yaw) from the message (m, m, rad).
+    # 2. On the FIRST message, latches the origin (x0, y0, yaw0). The origin is the
+    #    first pose if rezero_odom is True, else (0, 0, 0): the absolute odom / MoCap
+    #    frame, which is the default.
+    # 3. Expresses every pose in that frame: translate by (x0, y0), rotate by -yaw0.
+    #    With the default origin this changes nothing.
+    # 4. Sets odom_received = True and tells RunManager (note_odom) that odom is alive.
+    # Also caches v_actual = twist.linear.x (m/s) for telemetry.
     # =========================================================================
     def odom_cb(self, msg: Odometry):
         raw_x = msg.pose.pose.position.x
@@ -140,8 +151,10 @@ class PidTrackerNode(Node):
         dx = raw_x - self.x0
         dy = raw_y - self.y0
         c0, s0 = math.cos(self.yaw0), math.sin(self.yaw0)
+        # rotate the offset by -yaw0 (world frame -> controller frame)
         self.x = c0 * dx + s0 * dy
         self.y = -s0 * dx + c0 * dy
+        # wrap the yaw difference to (-pi, pi]
         self.yaw = math.atan2(math.sin(raw_yaw - self.yaw0), math.cos(raw_yaw - self.yaw0))
         self.v_actual = msg.twist.twist.linear.x
         self.odom_received = True
@@ -150,8 +163,8 @@ class PidTrackerNode(Node):
     # =========================================================================
     # [ROS-IO] imu_cb(msg: Imu)
     # -------------------------------------------------------------------------
-    # Callback for /imu. Intentionally empty (placeholder for yaw-rate
-    #   damping).
+    # Callback for /imu. Intentionally empty: placeholder for yaw-rate damping.
+    # The message is received but not used by the control law.
     # =========================================================================
     def imu_cb(self, msg: Imu):
         pass  # Available for dynamic yaw-rate damping if needed
@@ -161,8 +174,14 @@ class PidTrackerNode(Node):
     # -------------------------------------------------------------------------
     # 50 Hz (0.02 s) timer callback. RunManager.tick() decides whether there is anything
     # to drive (it handles waiting, the approach, laps, the guard and the kill).
-    # 1. RunManager.tick() -> cte, heading_err, ref point (None: nothing to do).
-    # 2. PID + curvature feed-forward; v = v_ref*max(0.4, 1 - 0.5*|steer|/max_steer).
+    # 1. RunManager.tick() -> cte (m), heading_err (rad), lookahead ref point, nearest
+    #    index, dt (s). None means nothing to do this tick.
+    # 2. PID with curvature feed-forward (kappa and v_ref come from the lookahead point):
+    #      steer = atan(L*kappa) + kp_cte*cte + ki_cte*int(cte) + kd_cte*d(cte)/dt
+    #              + kp_heading*heading_err,  clipped to +-max_steer (rad)
+    #    int(cte) is clamped to +-0.5 (anti-windup); d(cte)/dt is a backward difference.
+    #    Speed: v = v_ref * max(0.4, 1 - 0.5*|steer|/max_steer), i.e. full speed on
+    #    straights, half speed at full lock (the 0.4 floor is never reached).
     # 3. RunManager.shape(): guard speed factor.
     # 4. ObstacleCbfLayer.apply(): closest safe (v, steer) on the known obstacles.
     # 5. RunManager.command(): publish /cmd_vel, lap statistics, CSV row.
@@ -174,10 +193,12 @@ class PidTrackerNode(Node):
         cte, heading_err, ref_pt, _idx, dt = tick
         _x_ref, _y_ref, _yaw_ref, v_ref, kappa_ref = ref_pt
 
+        # integral of cte (m*s), clamped so it cannot wind up
         self.integral_cte = np.clip(self.integral_cte + cte * dt, -0.5, 0.5)
         d_cte = (cte - self.prev_cte) / dt
         self.prev_cte = cte
 
+        # bicycle model: steering angle that follows curvature kappa
         ff_steer = math.atan(self.wheelbase * kappa_ref)
         pid_steer = (
             ff_steer
@@ -196,9 +217,10 @@ class PidTrackerNode(Node):
         self.run.command(v_safe, steer_safe, clearance, status)
 
     # =========================================================================
-    # [LIFE]   _reset_memory()
+    # [LIFE]   _reset_memory()  (helper: only used in this class, as RunManager on_start)
     # -------------------------------------------------------------------------
-    # Called at the start of each run: forgets the previous run's PID state.
+    # Called at the start of each run: forgets the previous run's PID state
+    # (integral_cte and prev_cte set to 0), so an old integral cannot kick the new run.
     # =========================================================================
     def _reset_memory(self):
         self.integral_cte = 0.0
@@ -208,8 +230,10 @@ class PidTrackerNode(Node):
 # [LIFE]   main(args=None)
 # -----------------------------------------------------------------------------
 # Console-script entry point (pid_tracker).
-# init rclpy -> construct node -> spin until Ctrl-C / SystemExit ->
-# stop robot, destroy node, shutdown rclpy.
+# init rclpy -> construct PidTrackerNode -> spin until Ctrl-C / SystemExit ->
+# stop robot (node.run.shutdown), destroy node, shutdown rclpy.
+# init_ros keeps the ROS context alive on Ctrl-C, so the stop command can still
+# be published in the finally block.
 # =============================================================================
 def main(args=None):
     # Plain Python SIGINT handling: Ctrl-C raises KeyboardInterrupt but keeps the

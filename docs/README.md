@@ -20,10 +20,10 @@ The package is modular, separating trajectory generation, state estimation, safe
 *   **`obstacle_cbf.py`**: The Control Barrier Function (CBF) safety filter, used by all four controllers. Using the known obstacle positions (no LiDAR), it adjusts speed and steering by the smallest amount that keeps the robot clear, going around obstacles on the path.
 *   **`run_manager.py`**: Everything a controller does besides steering, shared by all four: reach the path start, count laps, watch the errors, obey KILL, log each run, wait for the next path.
 *   **`approach_planner.py`**: Dubins paths: the shortest way an Ackermann robot can get onto a path.
-*   **`lap_stats.py`**: Per-lap numbers: error, time at the steering limit, steering rate.
+*   **`stats_lap.py`**: Per-lap numbers: error, time at the steering limit, steering rate.
 *   **`mpc_obstacles.py`**: Obstacles as constraints inside LTV-MPC and NMPC (`obstacle_mode:=constraint`), instead of the CBF filter.
 *   **`track_tools.py`**, **`track_publisher.py`**: The capsule track, and the node that sends it instead of a drawn path.
-*   **`lap_test.py`**, **`lap_report.py`**: The lap test sequence and its report. **`sim_limo.py`**: stand-in robot for rehearsing without the lab.
+*   **`run_laps.py`**, **`report_lap.py`**: The lap test sequence and its report. **`sim_limo.py`**: stand-in robot for rehearsing without the lab.
 *   **Controllers** (subscribe to `/hardware_odom` and `/hardware_obstacles`):
     *   **`pid_tracker_node.py`**: Kinematic Ackermann PID with Curvature Feedforward.
     *   **`lqr_tracker_node.py`**: Infinite-Horizon Continuous Algebraic Riccati Equation (ARE) tracker.
@@ -56,7 +56,7 @@ ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc obstacle_mar
 *   **Rim markers:** 4 markers evenly spaced around the top edge of each cylinder. Centre = mean of the 4, radius = mean distance from the centre, updated live if the obstacle moves. If a marker is occluded, the last known circle is kept. A group must be fully tracked once before it exists, and the bridge warns until then, so **check that the obstacle appears on the live plotter before driving**.
 *   **Behaviour:** the robot keeps its tracked point `robot_radius + safety_margin` (0.30 m) from each cylinder's edge, goes around an obstacle on its path, and rejoins. It stops (`CBF_STOP`) only if there is no safe way forward. Telemetry logs `min_clearance` and `safety_status`.
 *   **Space needed:** the LIMO cannot turn on the spot, so going around needs room. A gap narrower than about 0.6 m between obstacles, or an obstacle against a wall, can make it stop.
-*   **Why a filter and not the MPC itself:** neither MPC here has obstacle constraints. The LTV-MPC is an unconstrained Riccati solution, and the NMPC bounds only the steering. The CBF adds the safety constraint to all four controllers in the same way.
+*   **Why a filter by default:** the CBF adds the same safety constraint to all four controllers, after each one has computed its command. The LTV-MPC and NMPC can instead take the obstacles as constraints inside the solver (`obstacle_mode:=constraint`, `mpc_obstacles.py`): they then plan round the obstacle over their look-ahead and turn earlier and more smoothly, where the CBF clamps the heading at the last moment and the robot drives a straight tangent to the safety circle. `obstacle_lap.launch.py compare_modes:=true` runs both MPCs both ways for comparison. PID and LQR have no look-ahead, so they always use the CBF.
 
 ## `phasespace_msgs`
 
@@ -91,17 +91,60 @@ Because the control stack runs off-board, the base station and the LIMO must sha
 >
 > Check: `ros2 node info /nmpc_tracker_node` must list `/limo1/cmd_vel` under *Publishers*.
 
+### First: the lab check
+
+Run this before any tracking, each time the markers, the robot or the mocap calibration change. It finds what can't be seen from a desk. It reports and suggests; it changes nothing.
+
+With the robot still (it doesn't move):
+```bash
+ros2 launch limo_mocap_suite hw_check.launch.py
+```
+Then the slow test drive, at 0.15 m/s for about 30 s. Keep 3 m clear around the robot; it stops by itself if it gets further than that from where it started (`max_range`):
+```bash
+ros2 launch limo_mocap_suite hw_check.launch.py drive:=true ref_offset:=<your value>
+```
+
+| It checks | If wrong |
+|---|---|
+| Mocap rate, gaps, position and heading jitter | WARN |
+| Anything subscribed to the command topic | FAIL: robot off, wrong `ROS_DOMAIN_ID` or `robot_ns`. It won't drive |
+| Forward command makes the robot move | FAIL, and stops |
+| Yaw points along the driving direction | FAIL, and stops: about 180° means `front_id` and `rear_id` are swapped |
+| A left command turns left | FAIL, and stops: the mocap frame is mirrored, and tracking would run away |
+| Speed, steering trim, curvature left and right, against the model | WARN |
+| `ref_offset`, measured from the driving | WARN, with the measured value. It's rough, so confirm with a tape measure |
+| Tightest real radius each way | WARN, with the real steering limit |
+| Whether the robot stops by itself when commands stop | WARN: if it doesn't, a lost WiFi link leaves it driving, so keep the hardware stop in reach |
+
+The result prints at the end and goes to `evaluation/hw_check_<date>_<time>/report.json`. KILL in the live view and Ctrl-C both stop it. If a bridge is already running, add `bridge:=false`.
+
+To rehearse with no robot or mocap, using simulated faults: `python3 tools/hw_test/run_hw_tests.py`.
+
 ### What happens when you press Publish
 
 1. **Getting there.** If the robot is more than 0.15 m from the path start, or more than 30° off its heading, it drives there first along a Dubins path: arcs of `approach_radius` (0.60 m) joined by a straight, at `approach_speed`. An Ackermann robot cannot turn on the spot, so it may have to loop around: starting just past the point needs a loop of about 4 m. The way there avoids known obstacles and stays inside the lab.
 2. **Driving.** An open path runs once. A closed path runs `laps` times (default 1, `laps:=0` until stopped). Laps are counted by forward progress along the path.
 3. **Afterwards.** The robot stops and the controller **stays running**: draw and publish another path and it goes again. Only Ctrl-C ends it. A new path during a run replaces the old one.
 
+### Lab day: lab track and the record/compare suites
+
+Step by step in [`LAB_GUIDE.md`](LAB_GUIDE.md). Lab track: radius 1.0 m, straights 4.0 m, centre (3.25, 1.25), inside the mocap area x -0.5..7.0, y -0.5..3.0. The robot drives itself to the race start first. Not tested on the real LIMO yet; `sim:=true` rehearses with the stand-in robot.
+```bash
+ros2 launch limo_mocap_suite record_lap.launch.py controller:=lqr
+```
+```bash
+ros2 launch limo_mocap_suite compare_lap.launch.py
+```
+```bash
+ros2 launch limo_mocap_suite obstacle_lap.launch.py
+```
+Logs are copied to the receiving machine with `tools/send_logs.sh`.
+
 ### Logs: the `evaluation/` folder
 
 Every run gets its own folder in `evaluation/`, relative to where you launched: `evaluation/<date>_<time>_<controller>_<path_name>/`, with `telemetry.csv` and `summary.json` (result, reason, stats per lap). Nothing is overwritten. Make a report from any folder holding runs:
 ```bash
-ros2 run limo_mocap_suite lap_report evaluation
+ros2 run limo_mocap_suite report_lap evaluation
 ```
 
 ### Capsule track: one controller
@@ -114,7 +157,7 @@ ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=lqr track_radius:
 ### Lap test: all controllers on three radii, with a report
 
 ```bash
-ros2 launch limo_mocap_suite lap_test.launch.py
+ros2 launch limo_mocap_suite run_laps.launch.py
 ```
 
 For each radius, each controller (`pid,lqr,mpc,nmpc`) in turn drives to the start and does 3 laps. It warns 5 s before moving. At 0.30 m/s the whole test takes roughly 40 minutes. Shorten it with the arguments below.
@@ -125,14 +168,14 @@ For each radius, each controller (`pid,lqr,mpc,nmpc`) in turn drives to the star
 | 0.5 m | At the limit |
 | 0.4 m | Beyond the limit (about 0.46 m): the robot must drift, which shows which controller recovers best |
 
-Results go to `evaluation/lap_test_<date>_<time>/`: `report.md` and `comparison.png` compare the radii, and `R1/`, `R0.5/`, `R0.4/` each have their own report. A run that cannot get round a tight track within its time limit is recorded, and the test goes on.
+Results go to `evaluation/run_laps_<date>_<time>/`: `report.md` and `comparison.png` compare the radii, and `R1/`, `R0.5/`, `R0.4/` each have their own report. A run that cannot get round a tight track within its time limit is recorded, and the test goes on.
 
 ```bash
-ros2 launch limo_mocap_suite lap_test.launch.py track_radii:=1.0 controllers:=lqr,nmpc laps:=2
+ros2 launch limo_mocap_suite run_laps.launch.py track_radii:=1.0 controllers:=lqr,nmpc laps:=2
 ```
 Rehearse with no robot and no lab:
 ```bash
-ros2 launch limo_mocap_suite lap_test.launch.py sim:=true robot_ns:=none
+ros2 launch limo_mocap_suite run_laps.launch.py sim:=true robot_ns:=none
 ```
 
 ### Safety while driving
@@ -143,6 +186,7 @@ ros2 launch limo_mocap_suite lap_test.launch.py sim:=true robot_ns:=none
 |---|---|
 | **KILL** button in the live view | Every controller stops and refuses to move until **RE-ARM** and a new path. A lap test ends there. The button depends on the window and ROS running: **it is not a hardware stop**. Keep the LIMO's own stop within reach |
 | No odometry for 0.5 s | Zero command until odometry returns. Leaving the MoCap area ends up here |
+| A marker jumps, or the two markers aren't their usual distance apart | The bridge drops the frame, so a ghost marker can't swing the heading. If frames keep being dropped, it counts as no odometry |
 | A controller stops reporting (lap test) | Zero command; the test stops |
 
 **Extensions, off by default:**
@@ -215,7 +259,7 @@ Checks that the LIMO's wheels do what `/cmd_vel` says, before any closed-loop ru
 ros2 launch limo_mocap_suite limo_test.launch.py                       # sends to /limo1/cmd_vel
 ros2 launch limo_mocap_suite limo_test.launch.py path:=circle speed:=0.15 robot_ns:=limo1
 # or without launch (remap yourself), starting straight away:
-ros2 run limo_mocap_suite limo_test_suite --ros-args -r /cmd_vel:=/limo1/cmd_vel -p path:=circle -p speed:=0.15 -p autostart:=true
+ros2 run limo_mocap_suite limo_test_suite --ros-args -p robot_ns:=limo1 -p path:=circle -p speed:=0.15 -p autostart:=true
 ```
 `limo_test.launch.py` arguments: `robot_ns` (default `limo1`, `none` = plain `/cmd_vel`), `path` (default `figure8`), `speed` (default `0.20`), `view` (default `behind`).
 
@@ -233,7 +277,7 @@ ros2 run limo_mocap_suite limo_test_suite --ros-args -r /cmd_vel:=/limo1/cmd_vel
 | `start_delay` | `3.0` | Countdown before moving (s); zero velocity is sent meanwhile |
 | `repeat` | `false` | Loop the test until STOP |
 | `autostart` | `false` | Start without pressing **Start** |
-| `wheelbase`, `max_steer` | `0.20`, `0.48869` | Same meaning as for the controllers |
+| `wheelbase`, `max_steer` | `0.20`, `0.4084` | Same meaning as for the controllers |
 | `auto_place` | `true` | Centre the drawn path on the lab grid (display only) |
 | `start_x`, `start_y` | `0.0`, `0.0` | With `auto_place:=false`: where the path starts on the lab grid, robot facing +X (display only) |
 | `lab_x`, `lab_y` | `[-0.5, 8.0]`, `[-1.0, 6.0]` | Lab extents of the grid |
@@ -272,6 +316,8 @@ The commands depend only on the path, `speed`, `wheelbase` and `max_steer`; plac
 | `front_id` | `0` | Index of the **front** marker in `msg.markers` |
 | `rear_id` | `1` | Index of the **rear** marker. Heading = rear → front |
 | `obstacles` | none | Flat list `[x, y, r, ...]` in metres, PhaseSpace frame: `-p "obstacles:=[1.97, 0.81, 0.35]"` |
+| `marker_baseline` | `0` | Distance between the robot's two markers (m); `0` learns it from the first frames, printed at startup |
+| `max_baseline_error` | `0.03` | A frame further than this from the marker distance is dropped (m) |
 | `obstacle_markers` | none | 4 rim markers per cylinder. With `ros2 launch`, write `obstacle_markers:="[(0,1,2,3),(4,5,6,7)]"`. With `ros2 run`, ROS's parser rejects bare tuples, so use a flat list `-p "obstacle_markers:=[0,1,2,3,4,5,6,7]"` or quote it `-p "obstacle_markers:='[(0,1,2,3),(4,5,6,7)]'"` |
 
 Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) are skipped.
@@ -286,7 +332,7 @@ Frames where a marker is missing, has `cond <= 0`, or sits at exactly (0, 0, 0) 
 | `obstacles` | none | Extra fixed cylinders for this controller, added to `/hardware_obstacles` |
 | `wheelbase` | `0.20` | LIMO wheelbase L (m) |
 | `ref_offset` | `0.10` | Distance of the marker midpoint **ahead of the rear axle** (m). Measure it on your robot: 0.10 assumes the midpoint is halfway between the axles |
-| `max_steer` | `0.48869` | Steering limit (rad, 28°) |
+| `max_steer` | `0.4084` | Steering limit (rad, 23.4°), the centre angle the LIMO driver allows |
 | `rezero_odom` | `false` | Absolute PhaseSpace frame (`false`) or path relative to the start pose (`true`) |
 | `run_duration` | `0.0` | Time limit in s; `0` = no limit |
 | `log_dir`, `path_name` | `evaluation`, `drawn` | Where each run's folder goes, and the label in its name |
@@ -380,7 +426,12 @@ The `matlab/` folder (workspace root) contains a MATLAB implementation of the sa
 It needs only base MATLAB; the Control System Toolbox is optional for `lqr`, and the ROS Toolbox is needed for hardware runs. See [`matlab/README.md`](../matlab/README.md) for requirements and a full explanation.
 
 ## Documentation
-*   `docs/Theory_Explanation.pdf`: kinematics, error dynamics and the maths of every controller.
-*   `docs/Code_Explanation.pdf`: every file and function, plus how the simulation package differs.
+*   `docs/Lab_Guide.pdf` (source `LAB_GUIDE.md`): the lab day, step by step.
+*   `docs/Design_Report.pdf` (`DESIGN_REPORT.md`): every design choice, why, the metrics, and likely questions.
+*   `docs/Code_Guide_Controllers.pdf` (`CODE_GUIDE_controllers.md`): the four controllers, the shared model and obstacle handling, function by function.
+*   `docs/Code_Guide_System.pdf` (`CODE_GUIDE_system.md`): bridge, run manager, way to the start, suites, reports and tools, function by function.
+*   `docs/Theory_Explanation.pdf`: kinematics, error dynamics, the maths of every controller, obstacles and reaching the start.
+*   `docs/Code_Explanation.pdf`: older full listing (before 2026-11-05), kept for its appendix on how the simulation package differs; the two code guides replace it.
+*   Rebuild the PDFs: `docs/build_docs.sh` (the guides, via pandoc and `docs/tex/`) and `latexmk -xelatex docs/Theory_Explanation.tex`. Fonts: Fira Sans, Fira Mono, Fira Math from TeX Live.
 *   `CHANGELOG.md` (workspace root): what changed, from what, and why.
 *   Rebuild either PDF with `./build_pdf.sh <file>.tex` from `docs/`.

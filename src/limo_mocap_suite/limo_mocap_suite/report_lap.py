@@ -1,12 +1,22 @@
 # #############################################################################
-# [FILE]   lap_report.py
+# [FILE]   report_lap.py
 # -----------------------------------------------------------------------------
-# FILE  : src/limo_mocap_suite/limo_mocap_suite/lap_report.py
+# FILE  : src/limo_mocap_suite/limo_mocap_suite/report_lap.py
 # ROLE  : Turns run folders into a report: report.md, summary.csv and charts.
 #         Works on a lap test folder or on any folder holding run folders.
 #
-# Console script : ros2 run limo_mocap_suite lap_report <folder>
+# Console script : ros2 run limo_mocap_suite report_lap <folder>
+#                  (run_laps calls it at the end of a test)
 # No ROS; reads each run's telemetry.csv and summary.json.
+# Metrics per lap (computed while driving, in stats_lap.py, stored in summary.json):
+#   rms_cte / max_cte  RMS and largest distance from the path (m)
+#   sat_share          share of ticks with steering at the limit
+#   peak_steer_use     largest steering sent / limit;  peak_geometry_use: same for
+#                      the steering the path shape itself needs
+#   rms_steer_rate     RMS of the steering change per second (rad/s)
+#   lap_time, rejoins  seconds per lap, drift recoveries in the lap
+# Metrics from the telemetry here: recovery() (peak error and settling distance
+# after each curve).
 # Charts: tracks.png        driven lines against the path, one colour per lap
 #         laps.png          RMS and max error per lap: does each lap get better?
 #         error_along.png   error along the path per lap, curves shaded
@@ -23,6 +33,7 @@
 #   [LOG]    console prints and CSV telemetry (safe to skip)
 #   [LIFE]   node construction, startup and shutdown plumbing
 #   [UTIL]   small stateless helpers
+#   _name    a leading underscore = internal helper, only used inside this file/class
 # #############################################################################
 
 import csv
@@ -48,6 +59,8 @@ SETTLED_FOR = 0.5    # ... for this far along the path (m)
 # -----------------------------------------------------------------------------
 # Every sub-folder with a summary.json (or the folder itself). Adds the telemetry
 # columns as numpy arrays, text columns as lists.
+# Each dict is summary.json plus 'data' (the columns) and 'dir'. Sorted so the
+# plain runs come first, then the 'constraint' runs, each in controller order.
 # =============================================================================
 def load_runs(folder):
     dirs = [folder] + [os.path.join(folder, d) for d in sorted(os.listdir(folder))]
@@ -69,11 +82,19 @@ def load_runs(folder):
         run['data'] = data
         run['dir'] = d
         runs.append(run)
-    runs.sort(key=lambda r: ORDER.get(r['controller'], 9))
+    runs.sort(key=lambda r: (r.get('obstacle_mode') == 'constraint', ORDER.get(r['controller'], 9)))
     return runs
 
 
+# =============================================================================
+# [UTIL]   _on_track(run, lap=None) -> bool mask or None  (helper: used only in this file)
+# -----------------------------------------------------------------------------
+# Which telemetry rows are in the TRACK phase (not the approach), optionally
+# only those of one lap. None: the run stopped before its first tick.
+# =============================================================================
 def _on_track(run, lap=None):
+    if 'phase' not in run['data']:     # run stopped before its first tick
+        return None
     d = run['data']
     if not d:
         return np.zeros(0, dtype=bool)
@@ -81,16 +102,33 @@ def _on_track(run, lap=None):
     return mask if lap is None else mask & (d['lap'] == lap)
 
 
+# =============================================================================
+# [UTIL]   _grid(n) -> (rows, cols)  (helper: used only in this file)
+# -----------------------------------------------------------------------------
+# Subplot layout for n runs: two columns when there is more than one run.
+# =============================================================================
 def _grid(n):
     cols = 2 if n > 1 else 1
     return (n + cols - 1) // cols, cols
 
 
+# =============================================================================
+# [UTIL]   _label(run) -> text  (helper: used only in this file)
+# -----------------------------------------------------------------------------
+# Controller name for legends and titles; "constraints" is added when the run used
+# the 'constraint' obstacle mode.
+# =============================================================================
 def _label(run):
     name = LABEL.get(run['controller'], run['controller'])
     return name + ' constraints' if run.get('obstacle_mode') == 'constraint' else name
 
 
+# =============================================================================
+# [UI]     _shade_curves(ax, run, mask)  (helper: used only in this file)
+# -----------------------------------------------------------------------------
+# Greys the parts of the path where |curvature| > 0.3 1/m, so the error plot
+# shows which stretches are curves.
+# =============================================================================
 def _shade_curves(ax, run, mask):
     d = run['data']
     order = np.argsort(d['s'][mask])
@@ -98,6 +136,12 @@ def _shade_curves(ax, run, mask):
     ax.fill_between(s, 0, 1, where=k > 0.3, transform=ax.get_xaxis_transform(), color='0.92', zorder=0, label='curve')
 
 
+# =============================================================================
+# [LOG]    plot_tracks(runs, out)  -> tracks.png
+# -----------------------------------------------------------------------------
+# One panel per run: the way to the path (dotted), each lap in its own colour,
+# the reference path (dashed) and the known obstacles as red discs. X / Y in m.
+# =============================================================================
 def plot_tracks(runs, out):
     rows, cols = _grid(len(runs))
     fig, axes = plt.subplots(rows, cols, figsize=(6.5 * cols, 4.6 * rows), squeeze=False)
@@ -128,6 +172,12 @@ def plot_tracks(runs, out):
     plt.close(fig)
 
 
+# =============================================================================
+# [LOG]    plot_laps(runs, out)  -> laps.png
+# -----------------------------------------------------------------------------
+# Two bar charts, one bar per lap and run: RMS error and largest error (cm).
+# Shows whether the controller gets better, or worse, from lap to lap.
+# =============================================================================
 def plot_laps(runs, out):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
     n_laps = max([len(r['laps']) for r in runs] + [1])
@@ -150,6 +200,12 @@ def plot_laps(runs, out):
     plt.close(fig)
 
 
+# =============================================================================
+# [LOG]    plot_error_along(runs, out)  -> error_along.png
+# -----------------------------------------------------------------------------
+# Per run: signed error (cm) against distance along the path (m), one line per
+# lap, curves shaded. Points are sorted by path distance before drawing.
+# =============================================================================
 def plot_error_along(runs, out):
     rows, cols = _grid(len(runs))
     fig, axes = plt.subplots(rows, cols, figsize=(6.5 * cols, 3.6 * rows), squeeze=False)
@@ -177,6 +233,13 @@ def plot_error_along(runs, out):
     plt.close(fig)
 
 
+# =============================================================================
+# [LOG]    plot_steering(runs, out)  -> steering.png
+# -----------------------------------------------------------------------------
+# Per run, last lap: steering sent and the steering the path geometry needs
+# (steer_ff), both in deg, against the steering limit (red). The title gives
+# the peak use and the share of the lap spent at the limit.
+# =============================================================================
 def plot_steering(runs, out):
     rows, cols = _grid(len(runs))
     fig, axes = plt.subplots(rows, cols, figsize=(6.5 * cols, 3.6 * rows), squeeze=False)
@@ -209,6 +272,14 @@ def plot_steering(runs, out):
     plt.close(fig)
 
 
+# =============================================================================
+# [LOG]    plot_curvature(runs, out)  -> curvature.png
+# -----------------------------------------------------------------------------
+# Error and steering use against how tight the curve is.
+# HOW: rows are grouped into bins of |curvature| (1/m). Per bin with more than
+# 20 rows: RMS error (left) and 95th percentile of |steering| / limit (right).
+# The red line is the curvature the steering limit allows.
+# =============================================================================
 def plot_curvature(runs, out):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
     edges = np.array([-0.01, 0.1, 0.4, 0.8, 1.2, 1.6, 2.0, 3.0, 6.0])
@@ -251,8 +322,9 @@ def recovery(run):
     d = run['data']
     m = _on_track(run)
     empty = {'peak_cm': float('nan'), 'settle_m': float('nan'), 'unsettled': 0, 'exits': 0}
-    if not m.any():
+    if m is None or not m.any():
         return empty
+    # HOW: a curve is |kappa| > 0.1 1/m. starts / ends = rows where it begins / ends.
     curve = np.abs(d['kappa'][m]) > 0.1
     err = np.abs(d['cte'][m])
     s = d['s'][m]
@@ -266,9 +338,12 @@ def recovery(run):
             continue
         begin, stop = before[-1], after[0]
         peaks.append(err[begin:stop].max())
-        dist = np.abs(s[end:stop] - s[end])
+        # distance driven since the curve exit, from the positions: s itself wraps to 0
+        # at the start line, which sits in the middle of a straight
+        x, y = d['x'][m][end:stop], d['y'][m][end:stop]
+        dist = np.concatenate(([0.0], np.cumsum(np.hypot(np.diff(x), np.diff(y)))))
         settled = None
-        for i in np.flatnonzero(err[end:stop] < SETTLED):
+        for i in np.flatnonzero(err[end:stop] < SETTLED):    # first point from which it stays settled
             later = (dist >= dist[i]) & (dist < dist[i] + SETTLED_FOR)
             if dist[-1] - dist[i] >= SETTLED_FOR and err[end:stop][later].max() < SETTLED:
                 settled = dist[i]
@@ -283,10 +358,21 @@ def recovery(run):
             'unsettled': unsettled, 'exits': len(peaks)}
 
 
+# =============================================================================
+# [UTIL]   _metres(value) -> text  (helper: used only in this file)
+# -----------------------------------------------------------------------------
+# Settling distance for the table: 'never' for NaN (it never settled), else metres.
+# =============================================================================
 def _metres(value):
     return 'never' if value != value else f'{value:.2f}'
 
 
+# =============================================================================
+# [LOG]    plot_recovery(runs, out)  -> recovery.png
+# -----------------------------------------------------------------------------
+# Two bar charts from recovery(): mean largest error per curve (cm) and the
+# distance to settle below SETTLED after a curve (m), one bar per run.
+# =============================================================================
 def plot_recovery(runs, out):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
     names = [_label(r) for r in runs]
@@ -306,6 +392,9 @@ def plot_recovery(runs, out):
 # [LOG]    write_tables(runs, folder)
 # -----------------------------------------------------------------------------
 # summary.csv (one row per lap) and report.md (results, then the charts).
+# report.md has a results table (per run: result, time to reach the path, rejoins,
+# RMS first / last lap, largest error, share at the steering limit), a recovery
+# table, the reason for each run that did not FINISH, and the chart list.
 # =============================================================================
 def write_tables(runs, folder):
     keys = ['rms_cte', 'max_cte', 'sat_share', 'peak_steer_use', 'peak_geometry_use', 'rms_steer_rate',
@@ -346,6 +435,15 @@ def write_tables(runs, folder):
         f.write('\n'.join(lines))
 
 
+# =============================================================================
+# [CORE]   generate(folder)  -> charts, summary.csv, report.md
+# -----------------------------------------------------------------------------
+# Builds the whole report for a folder.
+# HOW: if the folder holds radius sub-folders (R1, R0.5, ...), make a report for
+# each (recursion) and then compare_radii() across them. Otherwise load the runs,
+# draw the six charts for runs that logged telemetry, and write_tables().
+# Stops with a message if there is no run folder.
+# =============================================================================
 def generate(folder):
     runs = load_runs(folder)
     subs = [d for d in sorted(os.listdir(folder)) if d.startswith('R') and os.path.isdir(os.path.join(folder, d))]
@@ -359,12 +457,14 @@ def generate(folder):
         return
     if not runs:
         raise SystemExit(f'No run folders with summary.json in {folder}')
-    plot_tracks(runs, os.path.join(folder, 'tracks.png'))
-    plot_laps(runs, os.path.join(folder, 'laps.png'))
-    plot_error_along(runs, os.path.join(folder, 'error_along.png'))
-    plot_steering(runs, os.path.join(folder, 'steering.png'))
-    plot_curvature(runs, os.path.join(folder, 'curvature.png'))
-    plot_recovery(runs, os.path.join(folder, 'recovery.png'))
+    driven = [r for r in runs if 'phase' in r['data']]   # an aborted run may have no telemetry rows
+    if driven:
+        plot_tracks(driven, os.path.join(folder, 'tracks.png'))
+        plot_laps(driven, os.path.join(folder, 'laps.png'))
+        plot_error_along(driven, os.path.join(folder, 'error_along.png'))
+        plot_steering(driven, os.path.join(folder, 'steering.png'))
+        plot_curvature(driven, os.path.join(folder, 'curvature.png'))
+        plot_recovery(driven, os.path.join(folder, 'recovery.png'))
     write_tables(runs, folder)
     print(f"Report written: {os.path.join(folder, 'report.md')}")
 
@@ -373,7 +473,8 @@ def generate(folder):
 # [LOG]    compare_radii(folder, groups)
 # -----------------------------------------------------------------------------
 # Top-level report of a test with several radii: one table and one chart across them.
-# groups: list of (radius label, runs).
+# groups: list of (radius label, runs), widest radius first. Writes comparison.csv,
+# comparison.png (RMS last lap, error per curve, settling distance) and report.md.
 # =============================================================================
 def compare_radii(folder, groups):
     lines = ['# Lap test report: all radii', '', f'Folder: {os.path.basename(os.path.abspath(folder))}', '',
@@ -393,17 +494,17 @@ def compare_radii(folder, groups):
                 w.writerow([label, r['controller'], r['result'], len(laps), rms, peak, sat, x['peak_cm'], x['settle_m'], x['unsettled'], x['exits']])
                 lines.append(f"| {label} | {_label(r)} | {r['result']} | {len(laps)} | {100 * rms:.2f} | {100 * peak:.1f} | "
                              f"{100 * sat:.1f}% | {x['peak_cm']:.1f} | {_metres(x['settle_m'])} | {x['unsettled']} of {x['exits']} |")
-                series.setdefault(r['controller'], []).append((label, rms, x['peak_cm'], x['settle_m']))
+                series.setdefault(_label(r), []).append((label, rms, x['peak_cm'], x['settle_m']))
     labels = [g[0] for g in groups]
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
     width = 0.8 / max(len(series), 1)
-    for i, (ctrl, rows) in enumerate(sorted(series.items(), key=lambda kv: ORDER.get(kv[0], 9))):
+    for i, (ctrl, rows) in enumerate(series.items()):     # runs are already in order
         at = {row[0]: row for row in rows}
         pos = np.arange(len(labels)) + (i - (len(series) - 1) / 2.0) * width
         nan = float('nan')
         for ax, col, scale in zip(axes, (1, 2, 3), (100.0, 1.0, 1.0)):
             ax.bar(pos, [scale * at[n][col] if n in at else nan for n in labels], width,
-                   color=LAP_COLORS[i % 5], label=LABEL.get(ctrl, ctrl))
+                   color=LAP_COLORS[i % 5], label=ctrl)
     for ax, title in zip(axes, ('RMS error, last lap (cm)', 'Largest error per curve (cm)', 'Distance to settle after a curve (m)')):
         ax.set_xticks(np.arange(len(labels)))
         ax.set_xticklabels(labels)
@@ -420,9 +521,14 @@ def compare_radii(folder, groups):
     print(f"Report written: {os.path.join(folder, 'report.md')}")
 
 
+# =============================================================================
+# [LIFE]   main()  -> console script report_lap
+# -----------------------------------------------------------------------------
+# Takes one argument, the folder, and calls generate(). Usage text otherwise.
+# =============================================================================
 def main():
     if len(sys.argv) != 2:
-        raise SystemExit('Usage: lap_report <folder with run folders>')
+        raise SystemExit('Usage: report_lap <folder with run folders>')
     generate(sys.argv[1])
 
 

@@ -3,12 +3,19 @@
 # -----------------------------------------------------------------------------
 # FILE  : src/limo_mocap_suite/launch/hw_tracking.launch.py
 # ROLE  : One-command lab bring-up: bridge + one controller (+ optional GUI).
+#         The path is drawn in the builder, or a capsule track is sent with
+#         track_radius > 0. For repeatable lap tests with reports use
+#         record_lap / compare_lap (they go through run_laps.launch.py).
+# Asked : controller and track_radius (draw a path, or the R1 lab track).
+#         Whatever is given on the command line (controller:=lqr) is used and NOT
+#         asked; every other argument keeps its default.
 #
 # Usage : ros2 launch limo_mocap_suite hw_tracking.launch.py controller:=nmpc
 # Args  : controller         pid | lqr | mpc | nmpc          (default nmpc)
 #         builder            true | false: start the drawing GUI (default true)
 #         plotter            true | false: start the live plotter (default true)
-#         rezero_odom        true | false: path relative to start pose (true);
+#         rezero_odom        true | false: path relative to start pose (default false =
+#                            absolute mocap frame);
 #                            forwarded to the controller AND both GUIs
 #         run_duration       seconds, 0 = until the path end / Ctrl-C (0.0)
 #         obstacles          "[x, y, r, ...]" fixed cylinders (default: none)
@@ -16,11 +23,11 @@
 #         robot_radius, safety_margin, cbf_alpha  CBF clearance (0.20, 0.10, 0.6)
 #         cbf_max_steer      steering the CBF plans with; 0 = max_steer (0.0)
 #         lab_x, lab_y       "[min, max]" lab extents for both GUIs; '' = default
+#                            ([-0.5, 7.0] and [-0.5, 3.0])
 #         view               'behind' (+X up, +Y left) or 'topdown' for both GUIs
 #         track_radius       0 = draw a path (default); > 0 = capsule track, no drawing
 #         track_straight, track_x, track_y, start_delay   capsule size, centre, warning
 #         guard              true: stop / rejoin on drift (extension; default false)
-#                            ([-0.5, 8.0] and [-1.0, 6.0])
 #         ref_offset         marker midpoint ahead of the rear axle in m (0.10);
 #                            measure it on the robot, forwarded to the controller
 #         robot_ns           namespace of the LIMO's own topics (default limo1):
@@ -34,6 +41,7 @@
 #   [LOG]    console prints and CSV telemetry (safe to skip)
 #   [LIFE]   node construction, startup and shutdown plumbing
 #   [UTIL]   small stateless helpers
+#   _name    a leading underscore = internal helper, only used inside this file/class
 # #############################################################################
 
 from launch import LaunchDescription
@@ -43,15 +51,18 @@ from launch_ros.actions import Node
 import yaml
 
 from limo_mocap_suite.obstacle_cbf import parse_marker_groups, parse_obstacles
+from limo_mocap_suite.launch_prompts import CONTROLLERS as CHOICES, Ask, ask_first
 from limo_mocap_suite.robot_topics import DEFAULT_ROBOT_NS, robot_remappings
+from limo_mocap_suite.track_tools import TRACK_STRAIGHT, TRACK_X, TRACK_Y
 
-CONTROLLERS = ('pid', 'lqr', 'mpc', 'nmpc')
+CONTROLLERS = ('pid', 'lqr', 'mpc', 'nmpc')    # names accepted for controller:=
 
 
 # =============================================================================
-# [LIFE]   _controller_node(context)
+# [LIFE]   _controller_node(context) -> [Node]  (helper of generate_launch_description)
 # -----------------------------------------------------------------------------
-# Resolves the 'controller' argument at launch time and returns the matching
+# Runs at launch time (OpaqueFunction), when the answers are known.
+# Resolves the 'controller' argument and returns the matching
 # <controller>_tracker Node with rezero_odom / run_duration forwarded and
 # /cmd_vel, /imu remapped into robot_ns (robot_remappings).
 # Raises on an unknown controller name.
@@ -63,6 +74,7 @@ def _controller_node(context):
     rezero = LaunchConfiguration('rezero_odom').perform(context).lower() == 'true'
     duration = float(LaunchConfiguration('run_duration').perform(context))
     offset = float(LaunchConfiguration('ref_offset').perform(context))
+    # Parameters of the tracker node, all read from the launch arguments
     params = {'rezero_odom': rezero, 'run_duration': duration, 'ref_offset': offset,
               'laps': int(LaunchConfiguration('laps').perform(context)),
               'guard': LaunchConfiguration('guard').perform(context).lower() == 'true',
@@ -74,7 +86,7 @@ def _controller_node(context):
     for arg, key in (('lab_x', 'guard_lab_x'), ('lab_y', 'guard_lab_y')):
         text = LaunchConfiguration(arg).perform(context).strip()
         if text:
-            params[key] = [float(v) for v in yaml.safe_load(text)]
+            params[key] = [float(v) for v in yaml.safe_load(text)]    # "[min, max]" text -> list
     for arg in ('robot_radius', 'safety_margin', 'cbf_alpha', 'cbf_max_steer'):
         params[arg] = float(LaunchConfiguration(arg).perform(context))
     return [Node(
@@ -88,9 +100,9 @@ def _controller_node(context):
 
 
 # =============================================================================
-# [LIFE]   _bridge_node(context)
+# [LIFE]   _bridge_node(context) -> [Node]  (helper of generate_launch_description)
 # -----------------------------------------------------------------------------
-# Returns the phasespace_bridge Node with the 'obstacles' and 'obstacle_markers'
+# Returns the phasespace_bridge Node (markers -> /hardware_odom) with the 'obstacles' and 'obstacle_markers'
 # strings, each forwarded only when non-empty. Bad values fail here, at launch.
 # =============================================================================
 def _bridge_node(context):
@@ -111,17 +123,23 @@ def _bridge_node(context):
 
 
 # =============================================================================
-# [LIFE]   _track_node(context)
+# [LIFE]   _track_node(context) -> [Node] or []  (helper of generate_launch_description)
 # -----------------------------------------------------------------------------
-# With track_radius > 0, track_publisher sends the capsule instead of a drawn path.
+# With track_radius > 0, track_publisher sends the capsule instead of a drawn path
+# (/reference_path); with 0 it returns no node. The track sits in the lab frame,
+# so rezero_odom:=true is refused.
 # =============================================================================
 def _track_node(context):
     radius = float(LaunchConfiguration('track_radius').perform(context))
     if radius <= 0.0:
         return []
+    if LaunchConfiguration('rezero_odom').perform(context).lower() == 'true':
+        raise RuntimeError('track_radius places the track in the lab frame, so it needs rezero_odom:=false')
     params = {'track_radius': radius}
     for arg in ('track_straight', 'track_x', 'track_y', 'start_delay'):
         params[arg] = float(LaunchConfiguration(arg).perform(context))
+    for arg in ('start_side', 'direction', 'start_at'):
+        params[arg] = LaunchConfiguration(arg).perform(context)
     for arg in ('lab_x', 'lab_y'):
         text = LaunchConfiguration(arg).perform(context).strip()
         if text:
@@ -131,10 +149,12 @@ def _track_node(context):
 
 
 # =============================================================================
-# [LIFE]   _gui_nodes(context)
+# [LIFE]   _gui_nodes(context) -> [Node, ...]  (helper of generate_launch_description)
 # -----------------------------------------------------------------------------
 # Returns interactive_builder and live_plotter (each only if its argument is
 # true) with rezero_odom and, when non-empty, lab_x / lab_y (YAML lists).
+# The builder is skipped for a capsule track (nothing to draw). live_plotter gets
+# the robot remapping because its KILL button sends zero commands on /cmd_vel.
 # =============================================================================
 def _gui_nodes(context):
     params = {'rezero_odom': LaunchConfiguration('rezero_odom').perform(context).lower() == 'true',
@@ -145,6 +165,7 @@ def _gui_nodes(context):
             params[name] = [float(v) for v in yaml.safe_load(text)]
     remap = robot_remappings(LaunchConfiguration('robot_ns').perform(context))   # KILL sends zero commands
     nodes = []
+    # drawing = no capsule track, so the builder is useful
     for arg, exe in (('builder', 'interactive_builder'), ('plotter', 'live_plotter')):
         drawing = float(LaunchConfiguration('track_radius').perform(context)) <= 0.0
         if LaunchConfiguration(arg).perform(context).lower() == 'true' and (drawing or exe != 'interactive_builder'):
@@ -157,16 +178,18 @@ def _gui_nodes(context):
 # =============================================================================
 # [LIFE]   generate_launch_description()
 # -----------------------------------------------------------------------------
-# Declares the launch arguments, then starts:
+# Declares the launch arguments, asks for controller and track_radius
+# (launch_prompts; their empty default means "not given, ask"), then starts:
 # 1. phasespace_bridge (via _bridge_node: obstacles, obstacle_markers),
 # 2. the selected controller (via _controller_node),
 # 3. interactive_builder if builder:=true, live_plotter if plotter:=true
-#    (via _gui_nodes: rezero_odom, lab_x, lab_y).
+#    (via _gui_nodes: rezero_odom, lab_x, lab_y),
+# 4. track_publisher when track_radius > 0 (via _track_node).
 # =============================================================================
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('controller', default_value='nmpc',
-                              description='pid | lqr | mpc | nmpc'),
+        DeclareLaunchArgument('controller', default_value='',
+                              description='pid | lqr | mpc | nmpc (nmpc)'),
         DeclareLaunchArgument('builder', default_value='true',
                               description='Start the interactive path builder GUI'),
         DeclareLaunchArgument('plotter', default_value='true',
@@ -177,11 +200,15 @@ def generate_launch_description():
                               description='Laps on a closed path; 0 = until stopped. Open paths run once'),
         DeclareLaunchArgument('log_dir', default_value='evaluation',
                               description='Each run gets its own folder here'),
-        DeclareLaunchArgument('track_radius', default_value='0.0',
+        DeclareLaunchArgument('track_radius', default_value='',
                               description='0 = draw a path; > 0 = capsule track with this curve radius (m)'),
-        DeclareLaunchArgument('track_straight', default_value='3.0', description='Capsule straight length (m)'),
-        DeclareLaunchArgument('track_x', default_value='3.75', description='Capsule centre X (m)'),
-        DeclareLaunchArgument('track_y', default_value='2.5', description='Capsule centre Y (m)'),
+        DeclareLaunchArgument('track_straight', default_value=str(TRACK_STRAIGHT), description='Capsule straight length (m)'),
+        DeclareLaunchArgument('track_x', default_value=str(TRACK_X), description='Capsule centre X (m)'),
+        DeclareLaunchArgument('track_y', default_value=str(TRACK_Y), description='Capsule centre Y (m)'),
+        DeclareLaunchArgument('start_side', default_value='auto',
+                              description="Race start straight: 'auto' (top, or bottom if the robot is nearer it), 'top', 'bottom'"),
+        DeclareLaunchArgument('direction', default_value='ccw', description="'ccw' or 'cw'"),
+        DeclareLaunchArgument('start_at', default_value='middle', description="'middle' or 'begin' of the straight"),
         DeclareLaunchArgument('start_delay', default_value='5.0', description='Capsule: seconds of warning before moving'),
         DeclareLaunchArgument('guard', default_value='false',
                               description='true: slow, rejoin and stop on drift (extension)'),
@@ -219,6 +246,10 @@ def generate_launch_description():
         DeclareLaunchArgument('robot_ns', default_value=DEFAULT_ROBOT_NS,
                               description="LIMO topic namespace: /cmd_vel -> /<robot_ns>/cmd_vel (none = no namespace)"),
 
+        ask_first('hw_tracking: one controller on a drawn path or the lab track', [
+            Ask('controller', 'Controller', 'nmpc', CHOICES),
+            Ask('track_radius', 'Path', '0.0', [('0.0', 'draw it in the path builder'), ('1.0', 'R1 lab track')], strict=False),
+        ]),
         OpaqueFunction(function=_bridge_node),
         OpaqueFunction(function=_controller_node),
         OpaqueFunction(function=_gui_nodes),

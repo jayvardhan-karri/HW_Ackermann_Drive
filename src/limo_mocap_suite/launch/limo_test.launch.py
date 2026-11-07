@@ -12,6 +12,10 @@
 #         path      straight | circle | figure8 | drawn  (default figure8)
 #         speed     m/s during the test (default 0.20)
 #         view      behind | topdown (default behind); use the same in the builder
+# Open loop: the commands come from the path only, no odometry or mocap, so it
+# checks the connection and the actuators, not the tracking.
+# Asked : path and speed. Whatever is given on the command line is used and NOT
+#         asked. robot_ns and view are never asked and keep their defaults.
 #
 # TAG LEGEND (grep for these to jump / skip):
 #   [CORE]   control / estimation math that decides robot motion
@@ -20,19 +24,23 @@
 #   [LOG]    console prints and CSV telemetry (safe to skip)
 #   [LIFE]   node construction, startup and shutdown plumbing
 #   [UTIL]   small stateless helpers
+#   _name    a leading underscore = internal helper, only used inside this file/class
 # #############################################################################
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-from limo_mocap_suite.robot_topics import DEFAULT_ROBOT_NS, robot_remappings
+from limo_mocap_suite.launch_prompts import Ask, ask_first
+from limo_mocap_suite.robot_topics import DEFAULT_ROBOT_NS
 
 
 # =============================================================================
-# [LIFE]   _test_node(context)
+# [LIFE]   _test_node(context) -> [Node]  (helper of generate_launch_description)
 # -----------------------------------------------------------------------------
-# Returns the limo_test_suite Node with path / speed and the robot_ns remap.
+# Runs at launch time (OpaqueFunction), after the questions were answered.
+# Returns the limo_test_suite Node with path, speed, view and robot_ns. The node
+# itself maps robot_ns to /<robot_ns>/cmd_vel, so no remapping is needed here.
 # =============================================================================
 def _test_node(context):
     return [Node(
@@ -41,23 +49,29 @@ def _test_node(context):
         output='screen',
         parameters=[{'path': LaunchConfiguration('path').perform(context),
                      'speed': float(LaunchConfiguration('speed').perform(context)),
-                     'view': LaunchConfiguration('view').perform(context)}],
-        remappings=robot_remappings(LaunchConfiguration('robot_ns').perform(context)),
+                     'view': LaunchConfiguration('view').perform(context),
+                     'robot_ns': LaunchConfiguration('robot_ns').perform(context)}],
     )]
 
 
 # =============================================================================
 # [LIFE]   generate_launch_description()
 # -----------------------------------------------------------------------------
-# Declares robot_ns / path / speed / view and starts the test suite.
+# Declares robot_ns / path / speed / view, asks for path and speed (launch_prompts;
+# their empty default means "not given, ask") and starts the test suite.
 # =============================================================================
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('robot_ns', default_value=DEFAULT_ROBOT_NS,
                               description="LIMO topic namespace (none = no namespace)"),
-        DeclareLaunchArgument('path', default_value='figure8',
+        DeclareLaunchArgument('path', default_value='',
                               description='straight | circle | figure8 | drawn'),
-        DeclareLaunchArgument('speed', default_value='0.20', description='test speed (m/s)'),
+        DeclareLaunchArgument('speed', default_value='', description='test speed (m/s)'),
         DeclareLaunchArgument('view', default_value='behind', description='behind | topdown'),
+        ask_first('limo_test: open-loop drive, no feedback (checks the connection)', [
+            Ask('path', 'Path', 'figure8', [('straight', 'straight 2 m'), ('circle', 'circle'), ('figure8', 'figure 8'),
+                                    ('drawn', 'a path drawn in the builder')]),
+            Ask('speed', 'Speed (m/s)', '0.20', kind='float'),
+        ]),
         OpaqueFunction(function=_test_node),
     ])
