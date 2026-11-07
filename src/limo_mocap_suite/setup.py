@@ -30,6 +30,11 @@ setup(
             'nmpc_tracker = limo_mocap_suite.nmpc_tracker_node:main',
             'live_plotter = limo_mocap_suite.live_plotter_node:main',
             'limo_test_suite = limo_mocap_suite.limo_test_suite:main',
+            'hw_check = limo_mocap_suite.hw_check:main',
+            'run_laps = limo_mocap_suite.run_laps:main',
+            'report_lap = limo_mocap_suite.report_lap:main',
+            'sim_limo = limo_mocap_suite.sim_limo:main',
+            'track_publisher = limo_mocap_suite.track_publisher:main',
         ],
     },
 )

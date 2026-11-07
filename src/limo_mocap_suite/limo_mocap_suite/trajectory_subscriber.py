@@ -23,24 +23,33 @@ from nav_msgs.msg import Path
 # =============================================================================
 # [CORE]   class TrajectorySubscriber
 # -----------------------------------------------------------------------------
-# Holds the current reference path and answers 'where am I relative to it?'.
+# Holds the current reference path as a table and answers 'where am I relative to it?'.
+# waypoints[i] = [x (m), y (m), yaw (rad), v_ref (m/s), kappa (1/m)], kappa > 0 = left turn.
+# Closed loop: indices wrap; open path: indices clamp and goal_reached can be set.
+# Other classes read: waypoints, is_closed, ref_offset, path_ready, goal_reached,
+# last_idx (search start) and new_path (set here, cleared by RunManager).
 # =============================================================================
 class TrajectorySubscriber:
     """Dynamically computes reference states and curvature from a drawn Path."""
     # =========================================================================
-    # [LIFE]   __init__(node, v_nominal=0.40)
+    # [LIFE]   __init__(node, v_nominal=0.40, ref_offset=0.10)
     # -------------------------------------------------------------------------
-    # Stores the owning node and nominal speed, starts with an empty waypoint
-    # table (path_ready = False, is_closed = False, goal_reached = False) and
-    # subscribes to /reference_path on that node.
+    # Stores the owning node, the nominal speed (m/s) and ref_offset (m: the tracked
+    # point, i.e. the marker midpoint, lies this far ahead of the rear axle).
+    # Starts with an empty waypoint table (path_ready = False, is_closed = False,
+    # goal_reached = False, new_path = False, last_idx = 0) and subscribes to
+    # /reference_path (nav_msgs/Path, queue 10) on that node.
     # =========================================================================
-    def __init__(self, node, v_nominal=0.40):
+    def __init__(self, node, v_nominal=0.40, ref_offset=0.10):
         self.node = node
+        # Distance of the tracked point (marker midpoint) ahead of the rear axle (m)
+        self.ref_offset = ref_offset
         self.v_nominal = v_nominal
         self.waypoints = np.zeros((0, 5))
         self.path_ready = False
         self.is_closed = False
         self.goal_reached = False
+        self.new_path = False   # set by path_cb, cleared by RunManager
         self.last_idx = 0
         self.sub = self.node.create_subscription(Path, '/reference_path', self.path_cb, 10)
 
@@ -49,13 +58,17 @@ class TrajectorySubscriber:
     # -------------------------------------------------------------------------
     # Callback for /reference_path. Converts poses into the waypoint table:
     # 1. Ignore paths with < 4 poses.
-    # 2. Finite-difference derivatives (np.gradient) -> unit tangent, yaw.
-    # 3. Signed curvature kappa = (x' y'' - y' x'') / (x'^2 + y'^2)^1.5.
-    # 4. Speed profile v_ref = v_nominal / (1 + 0.75 |kappa|).
+    # 2. Finite differences (np.gradient) -> step length ds, unit tangent t = (dx, dy)/ds,
+    #    yaw = atan2(dy, dx).
+    # 3. Signed curvature (1/m) from the change of the unit tangent along the path:
+    #    kappa = (t_x * dt_y/ds - t_y * dt_x/ds) / |t|^3   (|t| = 1, so the divisor is ~1).
+    # 4. Speed profile v_ref = v_nominal / (1 + 0.75 |kappa|): slower in tight curves.
     # 5. Closed-loop test: first and last point closer than
     #    max(0.15 m, 3 x median spacing) -> is_closed (indices wrap), else open
     #    (indices clamp at the ends and goal_reached is set at the last point).
-    # 6. Store table, set path_ready = True, reset search index.
+    # 6. Store the table, set path_ready = True, goal_reached = False, new_path = True,
+    #    reset the search index.
+    # The path is used as given: it must already be in the controller frame.
     # =========================================================================
     def path_cb(self, msg):
         n = len(msg.poses)
@@ -68,15 +81,18 @@ class TrajectorySubscriber:
         dx = np.gradient(x)
         dy = np.gradient(y)
         ds = np.hypot(dx, dy)
+        # avoid division by zero on repeated points
         ds[ds == 0] = 1e-5
         
         dx_ds = dx / ds
         dy_ds = dy / ds
         
+        # d(unit tangent)/ds, so the curvature needs no extra scaling
         ddx = np.gradient(dx_ds) / ds
         ddy = np.gradient(dy_ds) / ds
         
         yaw = np.arctan2(dy, dx)
+        # |t|^3 is ~1; the 1e-9 only guards a zero division
         denom = (dx_ds**2 + dy_ds**2)**1.5 + 1e-9
         curvature = (dx_ds * ddy - dy_ds * ddx) / denom
         
@@ -92,8 +108,23 @@ class TrajectorySubscriber:
         self.path_ready = True
         self.goal_reached = False
         self.last_idx = 0
+        self.new_path = True
         kind = 'closed loop' if self.is_closed else 'open path'
         self.node.get_logger().info(f"Received new path! Waypoints generated: {n} ({kind})")
+
+    # =========================================================================
+    # [CORE]   load_table(table, closed, start_idx=0)
+    # -------------------------------------------------------------------------
+    # Replaces the table being tracked: RunManager swaps between the way to the
+    # path (approach) and the path itself. Rows are [x, y, yaw, v, kappa].
+    # Sets is_closed, last_idx = start_idx, goal_reached = False, path_ready = True.
+    # =========================================================================
+    def load_table(self, table, closed, start_idx=0):
+        self.waypoints = table
+        self.is_closed = closed
+        self.last_idx = int(start_idx)
+        self.goal_reached = False
+        self.path_ready = True
 
     # =========================================================================
     # [UTIL]   index(i) -> int
@@ -108,7 +139,7 @@ class TrajectorySubscriber:
     # =========================================================================
     # [UTIL]   normalize_angle(angle) -> float
     # -------------------------------------------------------------------------
-    # Wraps any angle into (-pi, pi] via atan2(sin, cos).
+    # Wraps any angle (rad) into (-pi, pi] via atan2(sin, cos).
     # =========================================================================
     @staticmethod
     def normalize_angle(angle: float) -> float:
@@ -117,14 +148,19 @@ class TrajectorySubscriber:
     # =========================================================================
     # [CORE]   compute_tracking_errors(x, y, yaw, lookahead_pts=8)
     # -------------------------------------------------------------------------
-    # Returns (cte, heading_err, lookahead_point, nearest_idx).
+    # Inputs: pose of the tracked point x, y (m), yaw (rad).
+    # Returns (cte [m], heading_err [rad], lookahead_point, nearest_idx).
+    # lookahead_point = (x, y, yaw, v, kappa) of the row lookahead_pts steps ahead.
     # 1. Nearest waypoint search in a sliding window [last_idx-25,
     #    last_idx+160) (wrapped or clamped via index()); fall back to a global
-    #    search if > 1.5 m away.
+    #    search if the best is > 1.5 m away (dist^2 > 2.25).
     # 2. Lookahead point = index(nearest_idx + lookahead_pts).
     # 3. cte = lateral offset of the NEAREST point in the path frame
     #    (positive = path lies to the robot's left).
-    # 4. heading_err = wrap(yaw_lookahead - yaw_robot).
+    # 4. heading_err = wrap(yaw_nearest - atan(ref_offset*kappa_nearest) - yaw).
+    #    Zero when tracking perfectly: a look-ahead yaw would be non-zero on any
+    #    curve and force a steady inside offset. The atan term is the angle
+    #    between the tracked point's travel direction and the robot's yaw.
     # 5. Open path only: once the nearest point is the last one and the robot
     #    is within 5 cm of (or past) it, set goal_reached = True.
     # Empty table -> zeros and the robot's own pose.
@@ -134,6 +170,7 @@ class TrajectorySubscriber:
         if n == 0:
             return 0.0, 0.0, (x, y, yaw, 0.0, 0.0), 0
             
+        # points searched ahead of last_idx (the 25 points behind allow small backward moves)
         search_window = 160
         window = np.arange(self.last_idx - 25, self.last_idx + search_window)
         indices = window % n if self.is_closed else np.clip(window, 0, n - 1)
@@ -142,6 +179,7 @@ class TrajectorySubscriber:
         best_local = int(np.argmin(dists_sq))
         nearest_idx = int(indices[best_local])
         
+        # squared distance: 1.5 m. Robot is far from the window (lost / new path): search all
         if dists_sq[best_local] > 2.25:
             all_dists = (self.waypoints[:, 0] - x)**2 + (self.waypoints[:, 1] - y)**2
             nearest_idx = int(np.argmin(all_dists))
@@ -154,8 +192,9 @@ class TrajectorySubscriber:
         
         dx_err = x_r - x
         dy_err = y_r - y
+        # component of (path point - robot) along the path normal (left of the path tangent)
         cte = -math.sin(yaw_r) * dx_err + math.cos(yaw_r) * dy_err
-        heading_err = self.normalize_angle(yaw_lh - yaw)
+        heading_err = self.normalize_angle(yaw_r - math.atan(self.ref_offset * kappa_r) - yaw)
 
         if not self.is_closed and nearest_idx == n - 1:
             # Signed distance along the final tangent: >= 0 means at / past the end

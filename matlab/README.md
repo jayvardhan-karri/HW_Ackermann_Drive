@@ -19,7 +19,7 @@ Tested with **MATLAB R2026a** on Ubuntu 22.04.
 | Curve Fitting Toolbox | — | **Not needed**: smoothing uses `smoothdata` instead of `csaps`/B-splines |
 | Image Processing Toolbox | — | **Not needed**: free-hand drawing uses figure mouse callbacks, not `drawfreehand` |
 
-For hardware runs you also need the **Python `phasespace_bridge`** running (it turns PhaseSpace markers into `/hardware_odom` and `/hardware_scan`), on the same `ROS_DOMAIN_ID` as `P.ros.domain_id`.
+For hardware runs you also need the **Python `phasespace_bridge`** running (it turns PhaseSpace markers into `/hardware_odom` and `/hardware_obstacles`), on the same `ROS_DOMAIN_ID` as `P.ros.domain_id`.
 
 ---
 
@@ -51,6 +51,27 @@ Outputs go to `matlab/results/`: `metrics.csv`, `comparison_paths.png`, `compari
 
 ---
 
+## 2a. Lap study: curve radius and an imperfect robot
+
+```matlab
+cd matlab/lap_study
+main_lap_study      % takes several minutes
+```
+
+A capsule track (3 m straights, 1 m curves), 3 laps per controller, on three robots: ideal, imperfect (`mismatch`) and very imperfect (`hard`), which differ in curvature gain, steering trim, servo lag, rate limit, delay and pose noise. It also sweeps the curve radius, with `max_steer` 0.4084 rad. The robots are made up. Figures and tables go to `results/lap_study/`:
+
+| File | Question |
+|---|---|
+| `laps_rms.png` | How large is the RMS error on each lap and robot? |
+| `cte_vs_s.png` | Where along the track is the error, per lap? |
+| `authority.png` | How much steering is sent, against the limit and what the geometry needs? |
+| `curvature_sweep.png` | How do error and steering use change as curves tighten? |
+| `lap_metrics.csv`, `curvature_sweep.csv` | Every number behind them |
+
+Lap-to-lap learning was removed: see `docs/FUTURE_lap_learning.md`.
+
+---
+
 ## 3. Folder layout
 
 ```
@@ -66,6 +87,12 @@ matlab/
 │   ├── build_reference.m   waypoint table: heading, curvature, speed profile, closed/open
 │   ├── ref_index.m         index wrap (closed) / clamp (open)
 │   └── tracking_errors.m   nearest point, look-ahead, cross-track and heading error, goal
+├── lap_study/
+│   ├── main_lap_study.m    capsule track, 3 laps, three robots, curvature sweep
+│   ├── capsule_path.m      the track
+│   ├── run_laps.m          closed loop against an imperfect robot, with laps
+│   ├── lap_defaults.m      lap study settings
+│   └── plot_lap_study.m, plot_curvature_sweep.m
 ├── controllers/
 │   ├── ctrl_pid.m          PID + curvature feed-forward
 │   ├── ctrl_lqr.m          gain-scheduled LQR (with gain cache)
@@ -75,8 +102,7 @@ matlab/
 │   ├── sample_horizon.m    reference points over the prediction horizon
 │   └── speed_law.m         shared speed command
 ├── safety/
-│   ├── synthetic_scan.m    ray-cast 240° LiDAR from the obstacle list
-│   └── lidar_safety_filter.m  speed limiter + repulsive steering
+│   └── cbf_filter.m        CBF safety filter on the known obstacles
 ├── sim/
 │   ├── controller_registry.m  name -> step function, rate, look-ahead
 │   ├── run_simulation.m    closed-loop simulation (bicycle model + servo lag)
@@ -108,7 +134,7 @@ draw_path / preset_path / .mat  ->  smooth_path  ->  build_reference  ->  ref (w
                v
   every control tick:  tracking_errors(ref, pose)  ->  err (cte, herr, look-ahead row, nearest)
                        controller step(err, pose, ref, mem)  ->  delta, v
-                       lidar_safety_filter(scan)  ->  delta, v (slowed / pushed away)
+                       cbf_filter(obstacles)  ->  delta, v (closest safe command)
                        clip delta,  omega = v tan(delta) / L
                |                                        |
      run_simulation: bicycle_step (plant)      run_on_limo: publish /cmd_vel, read /hardware_odom
@@ -150,7 +176,7 @@ The tightest curve the LIMO can follow is `κ_max = tan(28°) / 0.2 = 2.66 1/m` 
 **Tracking errors (`tracking_errors.m`).** This is the port of `compute_tracking_errors`:
 1. Nearest waypoint inside a sliding window `[last − 25, last + 160]`. This is fast, and it cannot jump to the other lobe where a figure-8 crosses itself. If the nearest point is more than 1.5 m away, it falls back to a global search.
 2. The look-ahead point is `nearest + lookahead` samples ahead. `ref_index` wraps the index on a closed loop and clamps it on an open path.
-3. `cte = −sin(yaw_r)(x_r − x) + cos(yaw_r)(y_r − y)`, which is positive when the path lies to the robot's left. `herr = wrap(yaw_lookahead − yaw)`.
+3. `cte = −sin(yaw_r)(x_r − x) + cos(yaw_r)(y_r − y)`, which is positive when the path lies to the robot's left. `herr = wrap(yaw_r − atan(ref_offset·κ_r) − yaw)`, which is zero when tracking perfectly. A look-ahead yaw would be non-zero on any curve and force a steady inside offset. The atan term is the angle between the tracked point's travel direction and the robot's yaw.
 4. Open path: `goal` is set when the nearest point is the last one and the robot is within 5 cm of it, or past it.
 
 ### 4.3 Robot model and shared laws
@@ -185,7 +211,7 @@ This is a port of the Python LTV-MPC with identical matrices and weights.
 4. `delta = Σ w_k atan(Lκ_k) − K₁ z + 0.06 ∫cte`, where the preview weights are `w = [0.45 0.25 0.15 0.10 0.05]`. The result is clipped.
 
 **NMPC (`ctrl_nmpc.m`)**
-Decision variables are the N = 10 steering angles, 0.08 s apart (0.8 s of preview). For a candidate `u`, the robot is forward-simulated with the **nonlinear** model and compared with reference sample k:
+Decision variables are the N = 10 steering angles, 0.08 s apart (0.8 s of preview). The roll-out is of the rear axle, and errors are measured at the tracked point `ref_offset` ahead of it, against the reference point at that same predicted time. For a candidate `u`, the robot is forward-simulated with the **nonlinear** model and compared with reference sample k:
 ```
 J(u) = Σ_k  q_cte·cte_k² + q_heading·herr_k² + rd·(u_k − u_{k−1})²,    |u_k| ≤ delta_max
 ```
@@ -199,29 +225,31 @@ Typical solve time is about 0.5 ms. Speed is not a decision variable; it comes f
 
 ### 4.5 Safety layer
 
-`synthetic_scan.m` ray-casts 719 rays over 240° against the obstacle circles in `P.obstacles`, exactly like the Python bridge. `lidar_safety_filter.m` then:
-* replaces invalid readings with 10 m;
-* takes the minimum range `dmin` in a ±32° corridor centred on half the steering angle;
-* adds repulsion `∓0.35(1/d − 1/0.65)` from the left and right sectors (10°–75°);
-* stops (`EMERGENCY_STOP`) at `dmin ≤ 0.28 m`, and scales speed down linearly (`CAUTION`, 15 % floor) below 0.85 m.
+`cbf_filter.m` is the port of `obstacle_cbf.py`. `P.obstacles` holds cylinders as `[x y r]` rows, and is **empty by default**.
 
-The simulation uses the synthetic scan; `run_on_limo` uses the real `/hardware_scan`. Disable it with `P.safety.enabled = false`.
+For the tracked point, with `h = |p − o| − R` and `R = r + robot_radius + safety_margin`:
+* **Barrier (the safety guarantee):** `(d·t) v + a (d·n) ω + α h ≥ 0`, where `d` is the unit vector from the obstacle, and `t`, `n` are the heading and left directions. This is one half-plane in `(v, ω)`.
+* **Input limits:** `0 ≤ v ≤ v_nominal` and `|ω| ≤ κ_max v`, a triangle, because an Ackermann robot cannot turn on the spot.
+* **Approach:** a distance barrier alone reacts too late: the robot arrives at the boundary pointing inwards and stops. So within `sqrt(R² + 2Rρ) − R + 0.25` of the boundary (`ρ` = turning radius), if the heading is inside the obstacle's collision cone, the reference turns towards a committed side and slows while turning hard.
+* **Result:** the closest point of the safe polygon to the reference, in closed form. `status` is `NO_OBSTACLES`, `CLEAR`, `CBF_ACTIVE` or `CBF_STOP`; `clearance` is the distance from the tracked point to the nearest cylinder edge.
+
+`run_simulation` uses `P.obstacles`. `run_on_limo` adds the latest `/hardware_obstacles` from the bridge, moved into the controller frame.
 
 ### 4.6 Simulation (`run_simulation.m`)
 
-* The plant is integrated every `P.sim.dt` = 10 ms. The controller runs at its own rate with a zero-order hold in between, like the ROS timers.
+* The plant is the rear axle, and the logged pose is the tracked point `P.ref_offset` ahead of it, as on the robot. It is integrated every `P.sim.dt` = 10 ms. The controller runs at its own rate with a zero-order hold in between, like the ROS timers.
 * **Steering servo lag:** a first-order lag `P.sim.steer_tau` = 0.05 s between the commanded and actual steering. Set it to 0 for an ideal actuator. With the lag, the high-gain controllers (LQR, LTV-MPC) show visible steering chatter. This is a real effect: it is why LQR has the highest steering rate in the Gazebo results too.
 * **Start:** the path start plus `P.sim.start_offset` (0.10 m to the side and 10° of heading by default), to show convergence.
 * **End:** an open path ends at its goal; a closed loop ends after `P.sim.laps` laps (time estimate); never longer than `P.sim.t_max`.
-* The log has one row per control tick: t, x, y, yaw, v, delta, omega, cte, herr, look-ahead point, dmin, safety status, solve time.
+* The log has one row per control tick: t, x, y, yaw, v, delta, omega, cte, herr, look-ahead point, clearance, safety status, solve time.
 
 `compute_metrics.m` uses the same definitions as the Python `compare_results.py`: RMS and max cross-track error, RMS heading error, and RMS steering rate.
 
 ### 4.7 Running on the LIMO (`run_on_limo.m`)
 
-1. It creates the ROS 2 node `/matlab_limo_controller` on `P.ros.domain_id`, subscribes to `/hardware_odom` and `/hardware_scan`, and publishes `/cmd_vel`.
+1. It creates the ROS 2 node `/matlab_limo_controller` on `P.ros.domain_id`, subscribes to `/hardware_odom` and `/hardware_obstacles`, and publishes on `P.ros.cmd_topic` (`/limo1/cmd_vel` by default, the namespaced LIMO).
 2. It waits up to 15 s for odometry (is the bridge running?). Then it publishes the path once on `/reference_path` (`P.ros.publish_path`), so the Python `live_plotter` can show it.
-3. Loop at the controller rate: the latest odometry is used as the pose. It is re-zeroed only if `P.ros.rezero_odom` is true; the default is false, so the drawn path is in the PhaseSpace frame. Then come the errors, the controller, the safety filter on the real scan, and `/cmd_vel` with `linear.x = v` and `angular.z = v·tan(delta)/L`.
+3. Loop at the controller rate: the latest odometry is used as the pose. It is re-zeroed only if `P.ros.rezero_odom` is true; the default is false, so the drawn path is in the PhaseSpace frame. Then come the errors, the controller, the CBF filter on the obstacles, and `/cmd_vel` with `linear.x = v` and `angular.z = v·tan(delta)/L`.
 4. It ends when an open path is finished, `P.ros.duration` elapses (0 = no limit), the live figure is closed, or on Ctrl-C. A **zero Twist is always sent** at the end, via `onCleanup`.
 5. It returns the same log as the simulation, plus `metrics`.
 
@@ -234,6 +262,7 @@ Do **not** run a Python controller at the same time: both would publish `/cmd_ve
 | Field | Default | Meaning |
 |---|---|---|
 | `L`, `max_steer`, `v_nominal` | 0.20 m, 0.48869 rad, 0.40 m/s | Robot |
+| `ref_offset` | 0.10 m | Tracked point (marker midpoint) ahead of the rear axle; measure it |
 | `lab_x`, `lab_y` | [−0.5 8], [−1 6] | Lab grid extents (m) |
 | `ref.ds` | 0.01 | Waypoint spacing (m) |
 | `ref.speed_gain` | 0.75 | Speed reduction in curves |
@@ -246,12 +275,13 @@ Do **not** run a Python controller at the same time: both would publish `/cmd_ve
 | `lqr.*` | q_cte 450, q_heading 35, r_steer 0.5, look-ahead 8 | LQR |
 | `mpc.*` | N 16, dt 0.04, q 520/35/42, r 0.28, rd 0.45, ki 0.06 | LTV-MPC |
 | `nmpc.*` | N 10, dt 0.08, q 40/8, rd 2.5, maxiter 8, 25 Hz | NMPC |
-| `safety.*` | enabled, stop 0.28, caution 0.85, repulse 0.65, gain 0.35 | LiDAR safety |
-| `obstacles` | [1.970681 0.80659 0.35] | Obstacles `[x y r]` per row, lab frame |
+| `cbf.*` | robot_radius 0.20, safety_margin 0.10, alpha 0.6, max_steer = `max_steer`, steer_weight 0.15 | CBF safety filter |
+| `obstacles` | `zeros(0,3)` (none) | Cylinders `[x y r]` per row, lab frame |
 | `sim.dt`, `sim.steer_tau` | 0.01 s, 0.05 s | Plant step, servo lag |
 | `sim.start_offset` | [0 0.10 10°] | Initial error [along, left, yaw] |
 | `sim.laps`, `sim.t_max` | 1, 120 s | Run length |
 | `ros.domain_id` | 0 | ROS_DOMAIN_ID |
+| `ros.cmd_topic` | `/limo1/cmd_vel` | The LIMO's velocity topic (`ros2 topic list` on the robot); `/cmd_vel` if it has no namespace |
 | `ros.rezero_odom` | false | Path relative to the start pose (true) or PhaseSpace frame (false) |
 | `ros.publish_path` | true | Publish the path on `/reference_path` |
 | `ros.duration` | 0 | Time limit on hardware (0 = none) |
@@ -264,9 +294,10 @@ Run in MATLAB R2026a in batch mode:
 
 | Test | Result |
 |---|---|
-| Figure-8 preset, all four controllers (simulation) | RMS CTE: PID 0.057, LQR 0.031, LTV-MPC 0.045, NMPC 0.032 m. Steering-rate RMS: NMPC 0.21 rad/s (smoothest), LQR 2.57 rad/s. Same ranking as the Gazebo experiments. |
+| Figure-8 preset, all four controllers (simulation, plant with 0.10 m offset) | RMS CTE after the 15 s start-up: PID 0.0105, LQR 0.0023, LTV-MPC 0.0025, NMPC 0.0052 m. Whole run: 0.019, 0.013, 0.013, 0.017 m. Steering-rate RMS: NMPC 0.20 rad/s (smoothest), LQR 2.53 rad/s. |
 | Jittery scripted free-hand S-curve (4 cm mouse noise) through `draw_path` → smoothing → all controllers | Max curvature after smoothing 3.4 1/m. All four reach the goal (end within 1 cm of the path end). RMS CTE 0.024–0.044 m. |
-| Obstacle placed on a straight path | Safety stopped the robot 0.28 m from the obstacle (`EMERGENCY_STOP`) |
+| Cylinder on the path (figure-8, straight dead ahead, two in a row), all four controllers | Minimum clearance 0.300–0.302 m against the required 0.30; no stops; goes around and reaches the goal |
+| `run_on_limo` (NMPC) in Gazebo: simulated markers → bridge → `/hardware_obstacles` → MATLAB CBF | Minimum clearance 0.301 m; no stops |
 | LQR gain vs the Theory worked example | `[-7.071 -3.582]` |
 | **ROS 2 end to end:** simulated LIMO publishing PhaseSpace frames → Python bridge → `run_on_limo(ref, 'nmpc', P)` → `/cmd_vel` → simulated LIMO | Reached the end of the S-curve in 27.9 s; RMS CTE 0.013 m; max 0.039 m; 0.63 ms per solve |
 

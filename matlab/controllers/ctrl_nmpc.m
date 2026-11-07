@@ -16,9 +16,10 @@ C = P.nmpc;
 if ~isfield(mem, 'u')
     mem.u = zeros(C.N, 1); mem.prev_steer = 0;
 end
-Hz = sample_horizon(ref, err.nearest, C.N, C.dt);
+Hz = sample_horizon(ref, err.nearest, C.N + 1, C.dt);
 u0 = [mem.u(2:end); atan(P.L * Hz(end, 5))];
-u = nmpc_solve(u0, pose, Hz, mem.prev_steer, P);
+% Residual k scores the state AFTER step k, so compare it with the point one step on
+u = nmpc_solve(u0, pose, Hz(2:end, :), mem.prev_steer, P);
 mem.u = u;
 delta = u(1);
 v = speed_law(Hz(1, 4), delta, P);
@@ -60,7 +61,9 @@ end
 
     % Nested: shares variables with nmpc_solve, so its locals use their own names.
     function rr = residual(uu)
-        x = pose(1); y = pose(2); th = pose(3);
+        % Roll out the rear axle; errors are taken at the tracked point ahead of it
+        roff = P.ref_offset;
+        th = pose(3); x = pose(1) - roff*cos(th); y = pose(2) - roff*sin(th);
         rr = zeros(3*N, 1);
         up = u_prev;
         for kk = 1:N
@@ -69,8 +72,9 @@ end
             y = y + vk * sin(th) * C.dt;
             th = th + vk / P.L * tan(uu(kk)) * C.dt;
             yr = Hz(kk, 3);
-            cte = -sin(yr) * (Hz(kk, 1) - x) + cos(yr) * (Hz(kk, 2) - y);
-            he = atan2(sin(yr - th), cos(yr - th));
+            cte = -sin(yr) * (Hz(kk, 1) - (x + roff*cos(th))) + cos(yr) * (Hz(kk, 2) - (y + roff*sin(th)));
+            ydes = yr - atan(roff * Hz(kk, 5));
+            he = atan2(sin(ydes - th), cos(ydes - th));
             rr(3*kk-2:3*kk) = [sqrt(C.q_cte)*cte; sqrt(C.q_heading)*he; sqrt(C.rd_steer)*(uu(kk) - up)];
             up = uu(kk);
         end

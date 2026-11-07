@@ -9,8 +9,11 @@
 #
 # Not a node. Mostly [UI]; StartFrame is the only math (same transform as the
 # controllers' odom_cb, so the GUIs show what the controllers see).
+# All three GUIs show the same view (parameter 'view'), so a path looks the same
+# in each. Only the display is rotated: ROS messages always carry real X, Y.
 # Heading convention: robot body +x = vector from the REAR marker (id 1) to
 # the FRONT marker (id 0), exactly as computed in phasespace_bridge.py.
+# Frame: mocap frame is ROS right-handed (+x forward, +y left, yaw counter-clockwise).
 #
 # TAG LEGEND (grep for these to jump / skip):
 #   [CORE]   control / estimation math that decides robot motion
@@ -26,16 +29,15 @@ import signal
 import threading
 
 import rclpy
-from rclpy.signals import SignalHandlerOptions
+from limo_mocap_suite.ros_compat import init_ros
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 # Lab floor covered by the PhaseSpace system (metres). Overridable per node with
 # the ROS parameters lab_x / lab_y (see declare_lab_params).
-LAB_X = (-0.5, 8.0)
-LAB_Y = (-1.0, 6.0)
-AXIS_COLOR = 'red'
+from limo_mocap_suite.track_tools import LAB_X, LAB_Y  # noqa: E402  mocap area, one place
+AXIS_COLOR = 'red'    # colour of the thick X / Y axes through (0, 0)
 
 # LIMO footprint used for the robot glyph (metres)
 BODY_LENGTH = 0.32
@@ -48,8 +50,8 @@ WALL_RADIUS = 100.0    # obstacles at least this big are drawn as walls
 # =============================================================================
 # [UTIL]   quat_to_yaw(q) -> float
 # -----------------------------------------------------------------------------
-# Planar yaw (rad) from a geometry_msgs Quaternion (same formula as the
-# controllers).
+# Planar yaw (rad, counter-clockwise from +x) from a geometry_msgs Quaternion
+# (same formula as the controllers). Only valid for a robot that stays flat.
 # =============================================================================
 def quat_to_yaw(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
@@ -58,24 +60,26 @@ def quat_to_yaw(q):
 # =============================================================================
 # [LIFE]   init_gui_ros(args)
 # -----------------------------------------------------------------------------
-# rclpy.init for a GUI node with plain Python SIGINT handling, and Ctrl-C
+# args: command-line args for rclpy. init_ros (plain Python SIGINT handling on
+# Foxy and Humble), and Ctrl-C
 # mapped to "close all windows". plt.show() then returns normally and the
 # node's cleanup (zero Twist, destroy, shutdown) runs, also under ros2 launch.
 # The GUIs' timers (5-10 Hz) let Python see the signal while Tk is idle.
 # =============================================================================
 def init_gui_ros(args=None):
-    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    init_ros(args)
     signal.signal(signal.SIGINT, lambda *_: plt.close('all'))
 
 
 # =============================================================================
 # [LIFE]   start_spin_thread(node) -> Thread
 # -----------------------------------------------------------------------------
-# Spins the node in a daemon thread (Matplotlib owns the main thread). The
+# node: the rclpy Node to spin. Spins it in a daemon thread (Matplotlib owns the main thread). The
 # exception raised when ROS shuts down underneath the spin is swallowed, so
 # closing a window prints no traceback.
 # =============================================================================
 def start_spin_thread(node):
+    # (nested) thread body: spin until ROS shuts down
     def run():
         try:
             rclpy.spin(node)
@@ -90,7 +94,8 @@ def start_spin_thread(node):
 # [UTIL]   declare_lab_params(node) -> (lab_x, lab_y)
 # -----------------------------------------------------------------------------
 # Declares and reads the lab_x / lab_y parameters ([min, max] in metres,
-# defaults LAB_X / LAB_Y) on a GUI node. Raises on a malformed range.
+# defaults LAB_X / LAB_Y) on a GUI node. Returns ((x_min, x_max), (y_min, y_max)).
+# Raises on a malformed range.
 # =============================================================================
 def declare_lab_params(node):
     node.declare_parameter('lab_x', list(LAB_X))
@@ -105,9 +110,25 @@ def declare_lab_params(node):
 
 
 # =============================================================================
+# [UTIL]   declare_view_param(node) -> behind_view (bool)
+# -----------------------------------------------------------------------------
+# Declares and reads the 'view' parameter of a GUI node. True = behind view:
+#   'behind'  (default): +X (forward) up, +Y (left) left
+#   'topdown'          : +X right, +Y up
+# Raises on any other value.
+# =============================================================================
+def declare_view_param(node):
+    node.declare_parameter('view', 'behind')
+    view = str(node.get_parameter('view').value)
+    if view not in ('behind', 'topdown'):
+        raise ValueError(f"'view' must be 'behind' or 'topdown', got '{view}'")
+    return view == 'behind'
+
+
+# =============================================================================
 # [UI]     style_lab_axes(ax, lab_x, lab_y, title, behind_view=False)
 # -----------------------------------------------------------------------------
-# Projector-friendly lab grid:
+# Projector-friendly lab grid (ax: Matplotlib axes, lab_x / lab_y: (min, max) in m):
 #   - limits = lab extents, equal aspect
 #   - 1 m major grid (dark) + 0.5 m minor grid (light)
 #   - thick RED lines on the X and Y axes (through 0) with '+X' / '+Y' labels
@@ -124,6 +145,7 @@ def style_lab_axes(ax, lab_x, lab_y, title, behind_view=False):
         ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{-v + 0.0:g}'))
         ax.set_xlabel('Y (m)   <- left   |   right ->', fontsize=13, fontweight='bold')
         ax.set_ylabel('X (m)   forward ->', fontsize=13, fontweight='bold')
+        ax.format_coord = lambda u, v: f'X={v:.2f} m  Y={-u:.2f} m'   # toolbar read-out: real X, Y
     else:
         ax.set_xlim(*lab_x)
         ax.set_ylim(*lab_y)
@@ -154,9 +176,22 @@ def style_lab_axes(ax, lab_x, lab_y, title, behind_view=False):
 
 
 # =============================================================================
+# [UI]     lab_legend(ax, behind_view=False)
+# -----------------------------------------------------------------------------
+# Draws the legend clear of the '+X' label and the status text, for either view.
+# Call it again after adding new labelled artists (e.g. obstacles).
+# =============================================================================
+def lab_legend(ax, behind_view=False):
+    if behind_view:
+        ax.legend(loc='upper left', bbox_to_anchor=(0.0, 0.95))
+    else:
+        ax.legend(loc='upper right')
+
+
+# =============================================================================
 # [UTIL]   to_view(x, y, yaw=0.0, behind_view=False) -> (u, v, yaw_view)
 # -----------------------------------------------------------------------------
-# Maps lab / robot-frame coordinates to plot coordinates. Identity for the
+# Maps lab / robot-frame coordinates (m, rad) to plot coordinates. Identity for the
 # top-down view; for the behind view (+X up, +Y left): u = -y, v = x,
 # yaw_view = yaw + pi/2.
 # =============================================================================
@@ -167,17 +202,36 @@ def to_view(x, y, yaw=0.0, behind_view=False):
 
 
 # =============================================================================
+# [UTIL]   from_view(u, v, behind_view=False) -> (x, y)
+# -----------------------------------------------------------------------------
+# Inverse of to_view: canvas coordinates back to real X, Y. The builder must
+# use this before publishing what was drawn. For the behind view: x = v, y = -u.
+# =============================================================================
+def from_view(u, v, behind_view=False):
+    if behind_view:
+        return v, -u
+    return u, v
+
+
+# =============================================================================
 # [CORE]   class StartFrame
 # -----------------------------------------------------------------------------
-# Mirrors the controllers' re-zeroing so the GUIs draw in the controller frame.
+# Mirrors the controllers' re-zeroing (rezero_odom) so the GUIs draw in the
+# controller frame.
 # rezero=True : latch() stores the FIRST pose given; apply() then expresses
 #               poses / points relative to it (translate + rotate).
 # rezero=False: identity (absolute PhaseSpace frame).
 # =============================================================================
 class StartFrame:
+    # =========================================================================
+    # [LIFE]   __init__(rezero=True)
+    # -------------------------------------------------------------------------
+    # rezero: same value as the controllers' rezero_odom parameter. With False
+    # the origin is fixed at (0, 0, 0) and the frame is ready at once.
+    # =========================================================================
     def __init__(self, rezero=True):
         self.rezero = rezero
-        self.origin = None if rezero else (0.0, 0.0, 0.0)
+        self.origin = None if rezero else (0.0, 0.0, 0.0)    # (x, y, yaw) of the frame in mocap coordinates
 
     # =========================================================================
     # [CORE]   latch(x, y, yaw)
@@ -188,6 +242,11 @@ class StartFrame:
         if self.origin is None:
             self.origin = (x, y, yaw)
 
+    # =========================================================================
+    # [UTIL]   ready -> bool  (property)
+    # -------------------------------------------------------------------------
+    # True once the origin is known; apply() must not be called before.
+    # =========================================================================
     @property
     def ready(self):
         return self.origin is not None
@@ -195,6 +254,7 @@ class StartFrame:
     # =========================================================================
     # [CORE]   apply(x, y, yaw=0.0) -> (x', y', yaw')
     # -------------------------------------------------------------------------
+    # Mocap pose (m, m, rad) -> controller-frame pose.
     # p' = R(-yaw0) (p - p0),  yaw' = wrap(yaw - yaw0).
     # =========================================================================
     def apply(self, x, y, yaw=0.0):
@@ -216,6 +276,12 @@ class StartFrame:
 # update() moves all parts; artists() returns them for the animation.
 # =============================================================================
 class RobotGlyph:
+    # =========================================================================
+    # [UI]     __init__(ax, label='LIMO')
+    # -------------------------------------------------------------------------
+    # Adds the (hidden) body, arrow and two marker dots to ax; they show up at
+    # the first update(). label is the legend text of the body.
+    # =========================================================================
     def __init__(self, ax, label='LIMO'):
         self.body = patches.Polygon([[0, 0]] * 4, closed=True, facecolor='0.85',
                                     edgecolor='0.3', lw=1.2, zorder=5, label=label)
@@ -233,12 +299,13 @@ class RobotGlyph:
     # =========================================================================
     # [UI]     update(x, y, yaw)
     # -------------------------------------------------------------------------
-    # Places the body rectangle, the M1 -> M0 arrow and both marker dots.
+    # x, y (m) and yaw (rad) in plot coordinates (use to_view first). Places the
+    # body rectangle, the M1 -> M0 arrow and both marker dots.
     # =========================================================================
     def update(self, x, y, yaw):
         c, s = math.cos(yaw), math.sin(yaw)
         hl, hw = BODY_LENGTH / 2.0, BODY_WIDTH / 2.0
-        corners = [(hl, hw), (-hl, hw), (-hl, -hw), (hl, -hw)]
+        corners = [(hl, hw), (-hl, hw), (-hl, -hw), (hl, -hw)]    # body corners, robot frame
         self.body.set_xy([(x + c * px - s * py, y + s * px + c * py) for px, py in corners])
         fx, fy = x + c * MARKER_OFFSET, y + s * MARKER_OFFSET
         rx, ry = x - c * MARKER_OFFSET, y - s * MARKER_OFFSET
@@ -247,32 +314,44 @@ class RobotGlyph:
         self.rear.set_data([rx], [ry])
         self.set_visible(True)
 
+    # =========================================================================
+    # [UI]     set_visible(visible)
+    # -------------------------------------------------------------------------
+    # Shows or hides all four parts together (hidden until the first pose).
+    # =========================================================================
     def set_visible(self, visible):
         for a in self.artists():
             a.set_visible(visible)
 
+    # =========================================================================
+    # [UI]     artists() -> list of Matplotlib artists
+    # -------------------------------------------------------------------------
+    # The four parts, for the animation / blitting code.
+    # =========================================================================
     def artists(self):
         return [self.body, self.heading, self.front, self.rear]
 
 
 # =============================================================================
-# [UI]     draw_obstacles(ax, flat, frame, old=()) -> list[Patch]
+# [UI]     draw_obstacles(ax, flat, frame, old=(), behind_view=False) -> list[Patch]
 # -----------------------------------------------------------------------------
 # Removes the previously drawn obstacle patches (old) and draws the flat
-# [x, y, r, ...] map transformed by `frame` (a ready StartFrame):
+# [x, y, r, ...] map (m, mocap frame) transformed by `frame` (a ready
+# StartFrame) and to_view:
 #   r <  WALL_RADIUS : filled red circle ('Obstacle')
 #   r >= WALL_RADIUS : dashed black circle edge (a wall; looks straight)
 # Returns the new patches so the caller can remove them next time.
 # =============================================================================
-def draw_obstacles(ax, flat, frame, old=()):
+def draw_obstacles(ax, flat, frame, old=(), behind_view=False):
     for p in old:
         p.remove()
     new = []
     first_obs, first_wall = True, True
     for i in range(0, len(flat) - 2, 3):
         ox, oy, _ = frame.apply(flat[i], flat[i + 1])
+        ox, oy, _ = to_view(ox, oy, behind_view=behind_view)
         r = flat[i + 2]
-        if r < WALL_RADIUS:
+        if r < WALL_RADIUS:    # first of each kind gets the legend label
             p = patches.Circle((ox, oy), r, facecolor='tomato', edgecolor='darkred',
                                alpha=0.6, zorder=3, label='Obstacle' if first_obs else None)
             first_obs = False

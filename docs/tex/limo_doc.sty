@@ -1,0 +1,106 @@
+% =============================================================================
+% limo_doc.sty: shared look for the LIMO MoCap documents (XeLaTeX).
+% Same palette and typography as Theory_Explanation.tex.
+% =============================================================================
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{limo_doc}
+\RequirePackage[a4paper, margin=2.3cm, headheight=14pt]{geometry}
+\RequirePackage{fontspec}
+\RequirePackage[english]{babel}
+% Fira: text, code and maths from one family (TeX Live fonts, loaded by file name)
+\setmainfont{FiraSans}[Extension=.otf, UprightFont=*-Book, ItalicFont=*-BookItalic,
+  BoldFont=*-SemiBold, BoldItalicFont=*-SemiBoldItalic]
+\newfontfamily\headingfont{FiraSans}[Extension=.otf, UprightFont=*-Medium, BoldFont=*-SemiBold]
+\setmonofont{FiraMono}[Extension=.otf, UprightFont=*-Regular, BoldFont=*-Medium,
+  ItalicFont=*-Oblique, Scale=0.86]
+\RequirePackage{amsmath, amssymb}
+\RequirePackage{unicode-math}
+\setmathfont{FiraMath-Regular.otf}
+\RequirePackage[table]{xcolor}
+\RequirePackage{graphicx, booktabs, longtable, array, calc, enumitem, titlesec, fancyhdr, caption}
+\RequirePackage{parskip}
+\RequirePackage{float}
+\floatplacement{figure}{H}
+\setkeys{Gin}{width=\linewidth,height=0.5\textheight,keepaspectratio}
+\RequirePackage[most]{tcolorbox}
+\RequirePackage{tikz}
+\RequirePackage{fancyvrb}
+\RequirePackage{fvextra}
+\RequirePackage{microtype}
+\setlength{\emergencystretch}{3em}   % lets lines with long code words spread instead of overflowing
+\RequirePackage[hidelinks]{hyperref}
+\RequirePackage{bookmark}
+
+% --- palette ---
+\definecolor{BrandBlue}{HTML}{005A9E}
+\definecolor{DarkSlate}{HTML}{2D3748}
+\definecolor{LightGray}{HTML}{EDF2F7}
+\definecolor{RuleGray}{HTML}{CBD5E0}
+\definecolor{CodeInk}{HTML}{1A4E7A}
+\definecolor{InsightGreen}{HTML}{27AE60}
+\definecolor{LightGreen}{HTML}{E9F7EF}
+
+% --- headings ---
+\setcounter{secnumdepth}{3}
+\titleformat{\section}{\headingfont\Large\bfseries\color{BrandBlue}}{\thesection}{0.7em}{}[{\color{RuleGray}\titlerule[0.6pt]}]
+\titleformat{\subsection}{\headingfont\large\bfseries\color{DarkSlate}}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\headingfont\normalsize\bfseries\color{DarkSlate}}{\thesubsubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{1.6em}{0.9em}
+\titlespacing*{\subsection}{0pt}{1.2em}{0.5em}
+\titlespacing*{\subsubsection}{0pt}{1.0em}{0.3em}
+
+% --- page style ---
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textcolor{gray}{LIMO MoCap Control Suite}}
+\fancyhead[R]{\small\textcolor{gray}{\@title}}
+\fancyfoot[C]{\small\textcolor{gray}{\thepage}}
+\renewcommand{\headrulewidth}{0.3pt}
+\renewcommand{\headrule}{{\color{RuleGray}\hrule width\headwidth height\headrulewidth}}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\textcolor{gray}{\thepage}}\renewcommand{\headrulewidth}{0pt}}
+
+% --- lists, links, captions ---
+\setlist{itemsep=2pt, topsep=4pt, parsep=0pt}
+\setlist[itemize]{label=\textcolor{BrandBlue}{\small\textbullet}}
+\hypersetup{colorlinks=true, linkcolor=BrandBlue, urlcolor=BrandBlue, citecolor=BrandBlue}
+\captionsetup{font=small, labelfont={bf,color=DarkSlate}}
+
+% --- inline code: tinted, may break after _ / . ---
+\let\oldtexttt\texttt
+\renewcommand{\texttt}[1]{\leavevmode{\color{CodeInk}\oldtexttt{#1}}}   % \leavevmode: keeps table cells on one baseline
+% inline code from pandoc goes through tex/limo_filter.lua, which adds break points
+
+% --- tables: roomy rows, light rules, zebra body ---
+\renewcommand{\arraystretch}{1.25}
+\setlength{\tabcolsep}{5pt}
+\setlength{\LTpre}{6pt}\setlength{\LTpost}{8pt}
+\arrayrulecolor{RuleGray}
+\heavyrulewidth=0.9pt \lightrulewidth=0.5pt
+
+% --- code blocks (pandoc Shaded / verbatim) ---
+\newtcolorbox{codebox}{colback=LightGray, colframe=LightGray, boxrule=0pt, arc=2pt,
+  left=6pt, right=6pt, top=4pt, bottom=4pt, breakable, before skip=6pt, after skip=8pt}
+
+% --- block quotes become green notes ---
+\renewenvironment{quote}{\begin{tcolorbox}[colback=LightGreen, colframe=InsightGreen, boxrule=0pt,
+  leftrule=3pt, arc=0pt, left=8pt, right=6pt, top=4pt, bottom=4pt, breakable]}{\end{tcolorbox}}
+
+% --- title page ---
+\newcommand{\limotitlepage}[3]{% title, subtitle, date
+  \begin{titlepage}
+  \thispagestyle{empty}
+  \begin{tikzpicture}[remember picture, overlay]
+    \fill[BrandBlue] (current page.north west) rectangle ([yshift=-7.5cm]current page.north east);
+    \node[anchor=north west, text=white, font=\fontsize{28}{34}\selectfont\bfseries, text width=16cm]
+      at ([xshift=2.3cm, yshift=-2.6cm]current page.north west) {#1};
+    \node[anchor=north west, text=white, font=\large, text width=16cm]
+      at ([xshift=2.3cm, yshift=-4.9cm]current page.north west) {#2};
+  \end{tikzpicture}
+  \null\vskip 7.2cm
+  {\large\color{DarkSlate}\textbf{LIMO MoCap Control Suite}}\par
+  {\color{gray}AgileX LIMO (Ackermann) with PhaseSpace motion capture, ROS 2 Foxy / Humble}\par
+  \vspace{0.6em}{\color{gray}#3}\par
+  \vfill
+  {\small\color{gray}Package \texttt{limo\_mocap\_suite}. Commands on \texttt{/limo1/cmd\_vel}.\par}
+  \end{titlepage}}
+\endinput

@@ -7,21 +7,22 @@ function result = run_on_limo(ref, name, P, opts)
 %     opts.Plot  live figure (default: true when the MATLAB desktop is running)
 %
 %   Requires ROS Toolbox. The Python phasespace_bridge must be running: it
-%   turns the PhaseSpace markers into /hardware_odom (and /hardware_scan).
+%   turns the PhaseSpace markers into /hardware_odom and /hardware_obstacles.
 %   Same ROS_DOMAIN_ID as P.ros.domain_id. Do NOT run a Python controller at
 %   the same time (both would publish /cmd_vel).
 %
 %   Loop (at the controller rate, 50 Hz / NMPC 25 Hz):
 %     1. latest /hardware_odom -> pose (optionally re-zeroed, P.ros.rezero_odom)
 %     2. tracking_errors -> controller step -> delta, v
-%     3. LiDAR safety filter on the latest /hardware_scan (if any)
-%     4. publish /cmd_vel: linear.x = v, angular.z = v*tan(delta)/L
+%     3. CBF safety filter on P.obstacles + the latest /hardware_obstacles
+%     4. publish P.ros.cmd_topic (default /limo1/cmd_vel, the namespaced
+%        LIMO): linear.x = v, angular.z = v*tan(delta)/L
 %   Ends when an open path is finished, P.ros.duration elapses (0 = no
 %   limit), the live figure is closed, or Ctrl-C. A zero Twist is ALWAYS
 %   sent at the end (onCleanup), whatever the reason.
 %
 %   result: log struct like run_simulation (t, x, y, yaw, v, delta, omega,
-%   cte, herr, x_ref, y_ref, dmin, status, solve_ms) + result.metrics.
+%   cte, herr, x_ref, y_ref, clearance, status, solve_ms) + result.metrics.
 if nargin < 4, opts = struct(); end
 if ~isfield(opts, 'Plot'), opts.Plot = usejava('desktop'); end
 c = controller_registry(name, P);
@@ -29,8 +30,8 @@ dt = 1 / c.rate_hz;
 
 node = ros2node('/matlab_limo_controller', P.ros.domain_id);
 odomSub = ros2subscriber(node, '/hardware_odom', 'nav_msgs/Odometry');
-scanSub = ros2subscriber(node, '/hardware_scan', 'sensor_msgs/LaserScan');
-cmdPub  = ros2publisher(node, '/cmd_vel', 'geometry_msgs/Twist');
+obsSub  = ros2subscriber(node, '/hardware_obstacles', 'std_msgs/Float32MultiArray', 'Durability', 'transientlocal');
+cmdPub  = ros2publisher(node, P.ros.cmd_topic, 'geometry_msgs/Twist');   % e.g. /limo1/cmd_vel
 cleanup = onCleanup(@() stop_robot(cmdPub)); %#ok<NASGU>
 if P.ros.publish_path
     pathPub = ros2publisher(node, '/reference_path', 'nav_msgs/Path');
@@ -53,9 +54,9 @@ origin = [];
 if opts.Plot, V = make_view(ref, P, c.label); end
 n_max = 200000; Z = nan(n_max, 1);
 L = struct('t', Z, 'x', Z, 'y', Z, 'yaw', Z, 'v', Z, 'delta', Z, 'omega', Z, ...
-           'cte', Z, 'herr', Z, 'x_ref', Z, 'y_ref', Z, 'dmin', Z, 'solve_ms', Z);
+           'cte', Z, 'herr', Z, 'x_ref', Z, 'y_ref', Z, 'clearance', Z, 'solve_ms', Z);
 L.status = cell(n_max, 1);
-mem = struct(); last_idx = 1; k = 0; goal = false;
+side = []; mem = struct(); last_idx = 1; k = 0; goal = false;
 fprintf('[run_on_limo] %s running at %d Hz. Close the figure or press Ctrl-C to stop.\n', c.label, c.rate_hz);
 t0 = tic; next = 0;
 while true
@@ -80,12 +81,14 @@ while true
     tic_s = tic;
     [delta, v, mem] = c.step(err, pose, ref, mem, P, dt);
     solve_ms = toc(tic_s) * 1000;
-    dmin = inf; status = 'NO_SCAN';
-    sc = scanSub.LatestMessage;
-    if P.safety.enabled && ~isempty(sc)
-        ang = double(sc.angle_min) + (0:numel(sc.ranges)-1)' * double(sc.angle_increment);
-        [v, delta, dmin, status] = lidar_safety_filter(v, delta, double(sc.ranges(:)), ang, P.safety);
-    end
+    % Obstacles are in the lab frame: move them into the controller frame (origin)
+    obs = P.obstacles;
+    om = obsSub.LatestMessage;
+    if ~isempty(om) && ~isempty(om.data), obs = [obs; reshape(double(om.data), 3, [])']; end
+    ol = obs;
+    ol(:, 1) = c0*(obs(:, 1) - origin(1)) + s0*(obs(:, 2) - origin(2));
+    ol(:, 2) = -s0*(obs(:, 1) - origin(1)) + c0*(obs(:, 2) - origin(2));
+    [v, delta, clearance, status, side] = cbf_filter(v, delta, pose, ol, P, side);
     delta = min(max(delta, -P.max_steer), P.max_steer);
     mem.prev_steer = delta;
     omega = 0; if abs(v) > 1e-4, omega = v * tan(delta) / P.L; end
@@ -95,7 +98,7 @@ while true
     k = k + 1;
     L.t(k) = t; L.x(k) = pose(1); L.y(k) = pose(2); L.yaw(k) = pose(3);
     L.v(k) = v; L.delta(k) = delta; L.omega(k) = omega; L.cte(k) = err.cte; L.herr(k) = err.herr;
-    L.x_ref(k) = err.la(1); L.y_ref(k) = err.la(2); L.dmin(k) = dmin; L.status{k} = status;
+    L.x_ref(k) = err.la(1); L.y_ref(k) = err.la(2); L.clearance(k) = clearance; L.status{k} = status;
     L.solve_ms(k) = solve_ms;
     if opts.Plot && mod(k, max(1, round(c.rate_hz / 10))) == 0
         update_view(V, L, k);

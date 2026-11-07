@@ -3,7 +3,7 @@ function startup_limo()
 %   Called automatically by main_track.m and run_on_limo.m.
 root = fileparts(mfilename('fullpath'));
 addpath(root);
-for d = {'path_tools', 'controllers', 'safety', 'sim', 'ros2', 'utils'}
+for d = {'path_tools', 'controllers', 'safety', 'sim', 'ros2', 'utils', 'lap_study'}
     addpath(fullfile(root, d{1}));
 end
 end

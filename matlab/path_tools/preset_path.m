@@ -3,10 +3,9 @@ function [x, y] = preset_path(name)
 %   [x, y] = preset_path(name), name is one of
 %     'figure8'  closed  x = 3.75 + 2.05 sin t, y = 3.0 + 0.9 sin 2t
 %     'circle'   closed  radius 1.5 m around (4.0, 3.0), counter-clockwise
-%     'oval'     closed  ellipse 3.2 x 1.8 m around (3.75, 3.0); passes near the obstacle
+%     'oval'     closed  ellipse 3.2 x 1.8 m around (3.75, 3.0)
 %     'scurve'   open    left-right S from (0.5, 2.5) to (6.5, 2.5)
 %     'straight' open    (0.5, 2.5) -> (6.5, 2.5)
-%   All presets avoid the default obstacle at (1.97, 0.81), r = 0.35 m.
 t = linspace(0, 2*pi, 1201)'; t(end) = [];
 switch lower(name)
     case 'figure8'
