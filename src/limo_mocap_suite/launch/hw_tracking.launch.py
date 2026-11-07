@@ -52,7 +52,7 @@ import yaml
 
 from limo_mocap_suite.obstacle_cbf import parse_marker_groups, parse_obstacles
 from limo_mocap_suite.launch_prompts import CONTROLLERS as CHOICES, Ask, ask_first
-from limo_mocap_suite.robot_topics import DEFAULT_ROBOT_NS, robot_remappings
+from limo_mocap_suite.robot_topics import DEFAULT_ROBOT_NS, parse_controller_params, robot_remappings
 from limo_mocap_suite.track_tools import TRACK_STRAIGHT, TRACK_X, TRACK_Y
 
 CONTROLLERS = ('pid', 'lqr', 'mpc', 'nmpc')    # names accepted for controller:=
@@ -89,6 +89,7 @@ def _controller_node(context):
             params[key] = [float(v) for v in yaml.safe_load(text)]    # "[min, max]" text -> list
     for arg in ('robot_radius', 'safety_margin', 'cbf_alpha', 'cbf_max_steer'):
         params[arg] = float(LaunchConfiguration(arg).perform(context))
+    params.update(parse_controller_params(LaunchConfiguration('controller_params').perform(context)))  # lab overrides
     return [Node(
         package='limo_mocap_suite',
         executable=f'{name}_tracker',
@@ -243,6 +244,8 @@ def generate_launch_description():
                               description='GUI lab Y extent "[min, max]" (empty = default)'),
         DeclareLaunchArgument('ref_offset', default_value='0.10',
                               description='Marker midpoint ahead of the rear axle (m)'),
+        DeclareLaunchArgument('controller_params', default_value='',
+                              description='Change controller parameters without editing code: "q_cte:=300 gain_cache:=false"'),
         DeclareLaunchArgument('robot_ns', default_value=DEFAULT_ROBOT_NS,
                               description="LIMO topic namespace: /cmd_vel -> /<robot_ns>/cmd_vel (none = no namespace)"),
 

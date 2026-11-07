@@ -40,3 +40,29 @@ def robot_remappings(robot_ns):
     if not ns or ns.lower() == 'none':
         return []
     return [(t, '/' + ns + t) for t in ROBOT_TOPICS]
+
+# =============================================================================
+# [UTIL]   parse_controller_params(text) -> {name: value}
+# -----------------------------------------------------------------------------
+# "q_cte:=300 r_steer:=0.8 gain_cache:=false" (spaces or commas between) ->
+# {'q_cte': 300, 'r_steer': 0.8, 'gain_cache': False}. Values are read as YAML,
+# so true/false and lists keep their type. A whole number becomes a float
+# (q_cte:=300 -> 300.0) unless the parameter is one of INT_PARAMS, because ROS
+# refuses an int for a parameter declared as a float. Used to change a
+# controller parameter at launch, in the lab, without editing code.
+# =============================================================================
+INT_PARAMS = ('laps', 'lookahead_pts', 'horizon_steps', 'max_rejoins')   # declared as int in the nodes
+
+
+def parse_controller_params(text):
+    import yaml
+    out = {}
+    for item in str(text or '').replace(',', ' ').split():
+        if ':=' not in item:
+            raise ValueError(f'controller_params: "{item}" is not name:=value')
+        name, value = item.split(':=', 1)
+        name, value = name.strip(), yaml.safe_load(value)
+        if isinstance(value, int) and not isinstance(value, bool):
+            value = int(value) if name in INT_PARAMS else float(value)
+        out[name] = value
+    return out

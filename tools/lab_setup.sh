@@ -106,7 +106,7 @@ _lab_setup_main() {
         sourced_list="$sourced_list, $repo_setup"
     else
         warn "repo workspace not built: $repo_setup"
-        echo "        cd $root && colcon build --packages-select limo_mocap_suite"
+        echo "        cd $root && colcon build --symlink-install --packages-select limo_mocap_suite"
     fi
 
     # ---------------- [3/4] ROS_DOMAIN_ID ----------------

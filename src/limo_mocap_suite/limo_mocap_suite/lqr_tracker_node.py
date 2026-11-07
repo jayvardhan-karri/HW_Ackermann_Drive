@@ -71,6 +71,7 @@ class LqrTrackerNode(Node):
         self.declare_parameter('q_cte', 450.0)
         self.declare_parameter('q_heading', 35.0)
         self.declare_parameter('r_steer', 0.5)
+        self.declare_parameter('gain_cache', True)   # false: solve the Riccati equation every tick
         self.declare_parameter('lookahead_pts', 8)
         self.declare_parameter('rezero_odom', False)  # False: track the path in the absolute odom / MoCap frame
 
@@ -86,6 +87,7 @@ class LqrTrackerNode(Node):
         self.traj = TrajectorySubscriber(self, v_nominal=v_nom,
                                          ref_offset=float(self.get_parameter('ref_offset').value))
         self._gain_cache = {}
+        self.use_gain_cache = bool(self.get_parameter('gain_cache').value)
         self.safety = ObstacleCbfLayer(self, self.wheelbase, self.max_steer, self.traj.ref_offset)
 
         self.x = 0.0
@@ -243,9 +245,12 @@ class LqrTrackerNode(Node):
     # Memoises _solve_lqr_gain on (v rounded to 1 mm/s, kappa rounded to
     # 0.01 1/m), so repeated operating points skip the Riccati solve. The solver
     # is called with the rounded values. The cache is cleared once it holds
-    # 5000 entries.
+    # 5000 entries. Parameter gain_cache:=false turns the memo off (same gains;
+    # for checking only, it costs one Riccati solve per tick).
     # =========================================================================
     def solve_lqr_gain_cached(self, v, kappa):
+        if not self.use_gain_cache:                  # gain_cache:=false: exact (v, kappa), no memo
+            return self._solve_lqr_gain(v, kappa)
         key = (round(v, 3), round(kappa, 2))
         if key not in self._gain_cache:
             if len(self._gain_cache) >= 5000:

@@ -25,7 +25,7 @@ cd <path to>/HW_Ackermann_Drive
 git pull
 ```
 ```bash
-colcon build --packages-select limo_mocap_suite
+colcon build --symlink-install --packages-select limo_mocap_suite
 ```
 ```bash
 source install/setup.bash
@@ -102,6 +102,30 @@ ros2 launch limo_mocap_suite obstacle_lap.launch.py compare_modes:=true
 It runs mpc, nmpc (CBF filter), then mpc:constraint, nmpc:constraint, in one session `evaluation/obstacle_modes_<stamp>/` with one report. Labels: "LTV-MPC" and "LTV-MPC constraints". In the `controllers` list of run_laps an entry such as `mpc:constraint` does the same for one controller. The CBF filters the command after the controller: it clamps the heading to the edge of the collision cone, so the robot drives a straight tangent to the 0.6 m safety circle, then round it. Constraint mode plans round the obstacle over the look-ahead, so it turns earlier and more smoothly. PID and LQR have no look-ahead, so they use the CBF only.
 
 This add-on is separate: nothing else depends on `lab_obstacles.py`.
+
+## Changing things in the lab
+
+**Change a controller setting without editing code.** Every lap suite and `hw_tracking` take `controller_params`: name:=value pairs, in quotes, passed to the controller node. The values are logged in the run's `settings.json`.
+
+```bash
+ros2 launch limo_mocap_suite record_lap.launch.py controller:=lqr 'controller_params:=q_cte:=300 r_steer:=0.8'
+```
+
+Useful names: PID `kp_cte ki_cte kd_cte kp_heading lookahead_pts`; LQR `q_cte q_heading r_steer gain_cache`; LTV-MPC and NMPC `q_cte q_heading rd_steer horizon_steps`; all `v_nominal max_steer ref_offset`. `gain_cache:=false` makes the LQR solve the Riccati equation every tick (same gains, for checking). Whole numbers are turned into decimals where the node expects one.
+
+**Edit the code.** Build once with `--symlink-install`. After that, an edited `.py` or launch file takes effect at the next `ros2 launch`, with no rebuild. A new file or a change to `setup.py` still needs `colcon build`.
+
+```bash
+colcon build --symlink-install --packages-select limo_mocap_suite
+```
+
+To comment out a line, put `#` in front of it. Keep track of what you changed:
+
+```bash
+git diff > ~/lab_changes_$(date +%Y%m%d).patch
+```
+
+Before the next `git pull`, put your edits aside with `git stash`, and bring them back with `git stash pop`. To get them to the main machine, send the patch file along with the logs, or copy it with `scp`.
 
 ## 6. Send the logs
 

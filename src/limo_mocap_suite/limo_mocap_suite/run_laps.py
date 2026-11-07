@@ -53,6 +53,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import Bool, String
 
 from limo_mocap_suite.ros_compat import init_ros
+from limo_mocap_suite.robot_topics import parse_controller_params
 from limo_mocap_suite.track_tools import (LAB_X, LAB_Y, TRACK_STRAIGHT, TRACK_X, TRACK_Y, capsule,
                                           capsule_message, pick_side)
 
@@ -80,7 +81,7 @@ class LapRunner(Node):
             'controllers': 'pid,lqr,mpc,nmpc', 'laps': 3, 'guard': False, 'v_nominal': 0.30,
             'track_straight': TRACK_STRAIGHT, 'track_radii': '1.0', 'track_x': TRACK_X, 'track_y': TRACK_Y,
             'start_side': 'auto', 'direction': 'ccw', 'start_at': 'middle', 'buffer_time': 10.0, 'session_name': 'run_laps',
-            'obstacle_mode': 'cbf',
+            'obstacle_mode': 'cbf', 'controller_params': '',
             'lab_x': list(LAB_X), 'lab_y': list(LAB_Y), 'log_dir': '', 'start_delay': 5.0,
             'cmd_topic': '/cmd_vel', 'imu_topic': '/imu', 'ref_offset': 0.10, 'wheelbase': 0.20,
             'max_steer': 0.4084, 'cbf_max_steer': 0.0, 'approach_radius': 0.60, 'approach_speed': 0.25, 'approach_spill': 0.30,
@@ -151,6 +152,7 @@ class LapRunner(Node):
             'slow_cte': p['slow_cte'], 'rejoin_cte': p['rejoin_cte'], 'abort_cte': p['abort_cte'],
             'guard_lab_x': p['lab_x'], 'guard_lab_y': p['lab_y'], 'obstacle_mode': mode or p['obstacle_mode'],
         }
+        params.update(parse_controller_params(p['controller_params']))   # lab overrides, e.g. q_cte:=300
         args = [exe, '--ros-args', '-r', f"/cmd_vel:={p['cmd_topic']}", '-r', f"/imu:={p['imu_topic']}"]
         for key, value in params.items():
             text = str(value).lower() if isinstance(value, bool) else str(value)

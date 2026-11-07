@@ -74,7 +74,7 @@ The bridge imports `phasespace_msgs`, so **the machine running `phasespace_bridg
 Ensure you are in the root of your hardware workspace (e.g., `HW_Ackermann_Drive`):
 
 ```bash
-colcon build --packages-select limo_mocap_suite
+colcon build --symlink-install --packages-select limo_mocap_suite
 source install/setup.bash
 ```
 

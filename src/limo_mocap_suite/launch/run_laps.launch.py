@@ -89,7 +89,7 @@ def _nodes(context):
     test.update(controllers=arg('controllers'), laps=int(arg('laps')),
                 guard=arg('guard').lower() == 'true', track_radii=arg('track_radii'),
                 start_side=arg('start_side'), direction=arg('direction'), start_at=arg('start_at'), session_name=arg('session_name'),
-                obstacle_mode=arg('obstacle_mode'),
+                obstacle_mode=arg('obstacle_mode'), controller_params=arg('controller_params'),
                 log_dir=arg('log_dir'), lab_x=lab_x, lab_y=lab_y, cmd_topic=cmd_topic, imu_topic=imu_topic)
     nodes.append(Node(package='limo_mocap_suite', executable='run_laps', output='screen',
                       emulate_tty=True, parameters=[test], remappings=remap))
@@ -118,6 +118,7 @@ def generate_launch_description():
         ('buffer_time', '10.0', 'Seconds stopped between two controllers'),
         ('session_name', 'run_laps', 'Test folder name: <session_name>_<stamp>'),
         ('obstacle_mode', 'cbf', "LTV-MPC / NMPC: 'cbf' filter or 'constraint' in the solver"),
+        ('controller_params', '', 'Change controller parameters without editing code: "q_cte:=300 gain_cache:=false"'),
         ('start_delay', '5.0', 'Seconds of warning before the robot moves'),
         ('lab_x', str(list(LAB_X)), 'Mocap area X; the track must fit, the guard stops outside it'),
         ('lab_y', str(list(LAB_Y)), 'Mocap area Y; the track must fit, the guard stops outside it'),
