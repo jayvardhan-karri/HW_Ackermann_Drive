@@ -111,7 +111,7 @@ This add-on is separate: nothing else depends on `lab_obstacles.py`.
 ros2 launch limo_mocap_suite record_lap.launch.py controller:=lqr 'controller_params:=q_cte:=300 r_steer:=0.8'
 ```
 
-Useful names: PID `kp_cte ki_cte kd_cte kp_heading lookahead_pts`; LQR `q_cte q_heading r_steer gain_cache`; LTV-MPC and NMPC `q_cte q_heading rd_steer horizon_steps`; all `v_nominal max_steer ref_offset`. `gain_cache:=false` makes the LQR solve the Riccati equation every tick (same gains, for checking). Whole numbers are turned into decimals where the node expects one.
+Useful names: PID `kp_cte ki_cte kd_cte kp_heading lookahead_pts`; LQR `q_cte q_heading r_steer gain_cache`; LTV-MPC and NMPC `q_cte q_heading rd_steer horizon_steps`; all `v_nominal max_steer ref_offset`. `gain_cache:=false` makes the LQR solve the Riccati equation every tick (same gains, for checking). `steer_gain` (all controllers) corrects a robot that steers less than commanded: real / commanded curvature, about 0.5 on the lab LIMO (`steer_gain_right` for right turns if different, e.g. 0.43). Use it with `max_steer:=0.215`, the robot's real limit: `'controller_params:=steer_gain:=0.5 steer_gain_right:=0.43 max_steer:=0.215'`. Whole numbers are turned into decimals where the node expects one.
 
 **Edit the code.** Build once with `--symlink-install`. After that, an edited `.py` or launch file takes effect at the next `ros2 launch`, with no rebuild. A new file or a change to `setup.py` still needs `colcon build`.
 

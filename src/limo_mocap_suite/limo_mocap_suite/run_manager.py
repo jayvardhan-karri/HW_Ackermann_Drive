@@ -95,6 +95,7 @@ class RunManager:
             'approach_radius': 0.60, 'approach_speed': 0.25, 'join_tol': 0.15, 'join_heading_deg': 30.0,
             'slow_cte': 0.15, 'rejoin_cte': 0.35, 'abort_cte': 1.00, 'max_rejoins': 3,
             'odom_timeout': 0.5, 'odom_abort': 3.0, 'obstacle_margin': 0.50, 'approach_spill': 0.30,
+            'steer_gain': 1.0, 'steer_gain_right': 0.0,   # real / commanded curvature; right 0 = same as left
             'guard_lab_x': list(LAB_X), 'guard_lab_y': list(LAB_Y),
         }
         for key, value in defaults.items():
@@ -262,7 +263,13 @@ class RunManager:
             self.last_cbf = time.monotonic()
         twist = Twist()
         twist.linear.x = float(v)
-        twist.angular.z = float(v / self.wheelbase * math.tan(steer)) if abs(v) > 1e-4 else 0.0
+        # steer_gain: real / commanded curvature of the robot (about 0.5 on the lab LIMO),
+        # so the driver is asked for proportionally more and the robot turns as wanted
+        if abs(v) > 1e-4:
+            gain = self.p['steer_gain'] if steer >= 0.0 or self.p['steer_gain_right'] <= 0.0 else self.p['steer_gain_right']
+            twist.angular.z = float(v / self.wheelbase * math.tan(steer) / max(gain, 0.05))   # ask for more, get what we want
+        else:
+            twist.angular.z = 0.0
         self.cmd_pub.publish(twist)
         if self.phase == 'TRACK':
             self.stats.record(self.steer_ff, steer, self.cte, self.dt,
